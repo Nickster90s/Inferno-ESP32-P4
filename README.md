@@ -27,6 +27,28 @@ virtual soundcard (DVS) on a Mac as the transmitter:
 
 Open issues are listed under [Known issues](#known-issues).
 
+## Thanks to Inferno
+
+**This project would not exist without [Inferno](https://github.com/teodly/inferno)**
+by Teo ([teodly](https://github.com/teodly), also on
+[GitLab](https://gitlab.com/lumifaza/inferno)), the open-source AoIP
+implementation for Linux. Almost everything a device has to say on this network
+was learned from reading it:
+
+- the request/response framing and the flow-control protocol: how to request a
+  flow, and the `13 37` keepalive that keeps it alive
+- the ARC opcodes and reply layouts: channel counts, device names, receive
+  channels, subscriptions
+- the CMC device advertisement, the info multicasts and the heartbeat
+- the mDNS records a device has to publish, and the channel-change event that
+  lets a patch turn green
+
+Years of careful reverse-engineering are collected in that codebase and
+generously published in the open. Inferno was used here as a specification, to
+read and learn from; the firmware in this repository is an independent
+implementation for a microcontroller. **A huge thank you to Teo and everyone who
+contributed to Inferno.**
+
 ## Legal
 
 Not affiliated with, authorized by or approved by any AoIP protocol vendor. The
