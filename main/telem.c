@@ -116,6 +116,9 @@ static int build_stats(char *out, size_t cap)
         "rx_bad_magic=%u\n"
         "rx_short=%u\n"
         "rx_wrong_len=%u\n"
+        "rx_ka_sent=%u\n"
+        "rx_ka_failed=%u\n"
+        "rx_ka_errno=%d\n"
         "flows_active=%u\n"
         "flow_req_ok=%u\n"
         "flow_req_failed=%u\n"
@@ -146,6 +149,7 @@ static int build_stats(char *out, size_t cap)
         (unsigned)jb.playout_steps,
         (unsigned)rx.packets, (unsigned)rx.bad_magic, (unsigned)rx.short_pkt,
         (unsigned)rx.wrong_len,
+        (unsigned)rx.ka_sent, (unsigned)rx.ka_failed, (int)rx.ka_last_errno,
         (unsigned)sub.flows_active, (unsigned)sub.requests_ok,
         (unsigned)sub.requests_failed, (unsigned)sub.keepalives_ok,
         (unsigned)sub.keepalives_lost, (unsigned)sub.resolve_failed,

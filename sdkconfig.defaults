@@ -24,6 +24,15 @@ CONFIG_ETH_PHY_INTERFACE_RMII=y
 CONFIG_ETH_DMA_BUFFER_SIZE=1600
 CONFIG_ETH_DMA_RX_BUFFER_NUM=20
 CONFIG_ETH_DMA_TX_BUFFER_NUM=10
+# TRANSMIT MUTEX -- REQUIRED. The PTP task (core 0) sends Delay_Req through
+# esp_eth_transmit_ctrl_vargs() to get a hardware TX timestamp, while lwIP
+# transmits from its own thread on core 1. Without this mutex the two write
+# the EMAC's TX descriptor ring concurrently. On the bench that leaked
+# descriptors over ~70 minutes -- stats replies slowing, unicast ARP going
+# unanswered, audio flows dropping in clusters -- until transmit died
+# entirely while receive (and PTP Sync) carried on.
+CONFIG_ETH_TRANSMIT_MUTEX=y
+
 # IEEE 1588 has no Kconfig switch in IDF 5.5 -- it is SOC_EMAC_IEEE1588V2_SUPPORTED
 # and enabled at runtime in eth_ts.c.
 

@@ -18,6 +18,9 @@ typedef struct {
     uint32_t bad_magic;
     uint32_t short_pkt;
     uint32_t wrong_len;
+    uint32_t ka_sent;           // flow keepalives handed to lwIP
+    uint32_t ka_failed;         // ... that sendto() refused
+    int32_t  ka_last_errno;
 } aoip_rx_stats_t;
 
 esp_err_t aoip_rx_start(void);

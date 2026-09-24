@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <string.h>
+#include <errno.h>
 
 static const char *TAG = "aoip_rx";
 
@@ -96,8 +97,15 @@ static void send_keepalives(void)
     for (int i = 0; i < AP_MAX_FLOWS; i++) {
         flow_t *fl = &s_flows[i];
         if (!fl->active || fl->sock < 0 || !fl->have_src) continue;
-        sendto(fl->sock, KEEPALIVE, sizeof(KEEPALIVE), 0,
-               (struct sockaddr *)&fl->src, sizeof(fl->src));
+        // CHECKED: an unsent keepalive is invisible otherwise, and four
+        // seconds of them is a dropped flow on the transmitter.
+        if (sendto(fl->sock, KEEPALIVE, sizeof(KEEPALIVE), 0,
+                   (struct sockaddr *)&fl->src, sizeof(fl->src)) == sizeof(KEEPALIVE)) {
+            s_st.ka_sent++;
+        } else {
+            s_st.ka_failed++;
+            s_st.ka_last_errno = errno;
+        }
     }
 }
 
