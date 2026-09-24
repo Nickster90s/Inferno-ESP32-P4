@@ -45,6 +45,7 @@ typedef struct {
     uint32_t keepalives_ok;
     uint32_t keepalives_lost;   // transmitter had forgotten the flow
     uint32_t resolve_failed;
+    uint32_t fallbacks;         // replacement refused -> break-before-make used
 } subscriber_stats_t;
 
 void subscriber_get_stats(subscriber_stats_t *out);

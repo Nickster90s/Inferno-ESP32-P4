@@ -1,3 +1,5 @@
+#include "eth_ts.h"
+#include "esp_heap_caps.h"
 // UART console.
 //
 // The escape hatch. RX_GATE.md's third safety layer was "the console is the
@@ -39,8 +41,33 @@ static void help(void)
       (unsigned)rate_get()->latency_min_us, AP_LATENCY_US_MAX);
 }
 
+static void health(void)
+{
+    // Where receive-side stalls have to be diagnosed from: heap (IDF mallocs
+    // every received frame from internal DMA-capable RAM) and the state of
+    // IDF's emac_rx task.
+    TaskHandle_t rx = xTaskGetHandle("emac_rx");
+    static const char *states[] = { "running", "ready", "BLOCKED", "suspended", "deleted", "invalid" };
+    eTaskState ts = rx ? eTaskGetState(rx) : eInvalid;
+    eth_ts_mac_dump();
+    uint32_t dst, mf, of; eth_ts_rx_diag(&dst, &mf, &of);
+    printf("  rx dma    state %u (3 waiting, 4 SUSPENDED no-desc, 0 stopped)  missed %u  fifo overflow %u\n",
+           (unsigned)dst, (unsigned)mf, (unsigned)of);
+    printf("  heap      internal free %u  min %u  largest %u | dma free %u largest %u\n"
+           "  emac_rx   %s  stack hwm %u   rx kicks %u  emac restarts %u  phy resets %u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+           rx ? states[ts < 6 ? ts : 5] : "not found",
+           rx ? (unsigned)uxTaskGetStackHighWaterMark(rx) : 0,
+           (unsigned)eth_ts_rx_kicks(), (unsigned)eth_ts_rx_restarts(), (unsigned)eth_ts_phy_resets());
+}
+
 static void stats(void)
 {
+    health();
     jb_stats_t jb; jb_get_stats(&jb);
     subscriber_stats_t sub; subscriber_get_stats(&sub);
     const rate_profile_t *r = rate_get();

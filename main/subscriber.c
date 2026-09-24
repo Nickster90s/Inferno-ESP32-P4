@@ -220,11 +220,30 @@ typedef struct {
     int            replaces;                    // flow slot to retire once this is up, or -1
 } want_t;
 
+// STATUS FROM A REBUILD MUST STILL BE CURRENT. rebuild() works on a snapshot
+// and can take seconds (mDNS). If the controller unsubscribed a channel in the
+// meantime, marking it ACTIVE from the stale snapshot made the patch "come
+// back" in the controller -- and nothing ever cleared it again. So a rebuild
+// only sets the status of a channel whose subscription is still the one it
+// worked on.
+static const rx_channel_t *s_snap;       // the snapshot rebuild() is working on
+
+static void set_status_if_current(uint8_t c, uint32_t st)
+{
+    if (!s_snap) { set_status(c, st); return; }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool current = strcmp(s_ch[c].tx_channel, s_snap[c].tx_channel) == 0 &&
+                   strcmp(s_ch[c].tx_device,  s_snap[c].tx_device)  == 0 &&
+                   s_ch[c].tx_channel[0];
+    xSemaphoreGive(s_lock);
+    if (current) set_status(c, st);
+}
+
 static void activate_slots(const flow_slot_t *f)
 {
     for (int k = 0; k < f->req.nslots; k++) {
         int8_t c = f->slot_to_ch[k];
-        if (c >= 0) set_status((uint8_t)c, ARC_SUB_ACTIVE);
+        if (c >= 0) set_status_if_current((uint8_t)c, ARC_SUB_ACTIVE);
     }
 }
 
@@ -244,6 +263,7 @@ static void rebuild(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     memcpy(snap, s_ch, sizeof(snap));
     xSemaphoreGive(s_lock);
+    s_snap = snap;
 
     // 1. What we WANT: one entry per transmitter device.
     want_t want[AP_MAX_FLOWS];
@@ -256,7 +276,7 @@ static void rebuild(void)
         tx_channel_t tx;
         if (!resolve_cached(c, &snap[c], &tx)) {
             s_st.resolve_failed++;
-            set_status(c, ARC_SUB_PENDING);
+            set_status_if_current(c, ARC_SUB_PENDING);
             continue;
         }
         if (tx.sample_rate != rate_hz()) {
@@ -265,7 +285,7 @@ static void rebuild(void)
             ESP_LOGW(TAG, "ch%u: %s transmits at %u Hz, we are at %s",
                      c + 1, snap[c].tx_device, (unsigned)tx.sample_rate,
                      rate_get()->label);
-            set_status(c, ARC_SUB_PENDING);
+            set_status_if_current(c, ARC_SUB_PENDING);
             continue;
         }
 
@@ -275,7 +295,7 @@ static void rebuild(void)
         if (w < 0) {
             if (nwant >= AP_MAX_FLOWS) {
                 ESP_LOGW(TAG, "ch%u: no free flow (max %d transmitters)", c + 1, AP_MAX_FLOWS);
-                set_status(c, ARC_SUB_PENDING);
+                set_status_if_current(c, ARC_SUB_PENDING);
                 continue;
             }
             w = nwant++;
@@ -291,7 +311,7 @@ static void rebuild(void)
             want[w].req.fpp = fpp;
         }
         if (want[w].req.nslots >= AP_MAX_CH_PER_FLOW) {
-            set_status(c, ARC_SUB_PENDING);
+            set_status_if_current(c, ARC_SUB_PENDING);
             continue;
         }
         uint8_t k = want[w].req.nslots++;
@@ -357,7 +377,23 @@ static void rebuild(void)
         f->req.rx_port = port;
         snprintf(f->req.rx_flow_name, sizeof(f->req.rx_flow_name), "rx%d", i);
 
-        if (flows_client_request(&f->req, f->handle) == ESP_OK) {
+        esp_err_t rq = flows_client_request(&f->req, f->handle);
+        if (rq != ESP_OK && w->replaces >= 0) {
+            // BREAK-BEFORE-MAKE FALLBACK. Some transmitters refuse a second,
+            // overlapping flow to the same receiver: the virtual soundcard
+            // answered 0x0301 to every replacement once, and patches then
+            // stuck -- an unpatched channel "came back", a new one never
+            // arrived. Stop the old flow, give it a moment, ask again. A short
+            // gap on this one transmitter is better than a stuck patch.
+            ESP_LOGW(TAG, "flow to %s: replacement refused -- stopping flow %d first",
+                     w->device, w->replaces);
+            tear_down((uint8_t)w->replaces);
+            w->replaces = -1;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            rq = flows_client_request(&f->req, f->handle);
+            s_st.fallbacks++;
+        }
+        if (rq == ESP_OK) {
             f->state = F_ACTIVE;
             f->last_packets = 0;
             f->next_action_us = esp_timer_get_time() + KEEPALIVE_MS * 1000;
@@ -380,9 +416,10 @@ static void rebuild(void)
             ESP_LOGW(TAG, "flow to %s refused; retrying%s", w->device,
                      w->replaces >= 0 ? " (old flow kept playing)" : "");
             for (int c = 0; c < w->req.nslots; c++)
-                if (w->slot_to_ch[c] >= 0) set_status((uint8_t)w->slot_to_ch[c], ARC_SUB_PENDING);
+                if (w->slot_to_ch[c] >= 0) set_status_if_current((uint8_t)w->slot_to_ch[c], ARC_SUB_PENDING);
         }
     }
+    s_snap = NULL;
 }
 
 // A subscription that could not be brought up (transmitter not resolved yet,
@@ -452,7 +489,7 @@ esp_err_t subscriber_start(void)
         snprintf(s_ch[c].friendly, sizeof(s_ch[c].friendly), "%u", c + 1);
     }
     load();
-    BaseType_t ok = xTaskCreatePinnedToCore(sub_task, "subscriber", 6144, NULL,
+    BaseType_t ok = xTaskCreatePinnedToCore(sub_task, "subscriber", 12288, NULL,
                                             AP_PRIO_CONTROL, NULL, AP_CORE_CONTROL);
     return ok == pdPASS ? ESP_OK : ESP_FAIL;
 }

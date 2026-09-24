@@ -5,6 +5,8 @@
 #include "esp_eth_driver.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "freertos/task.h"
+#include "freertos/FreeRTOS.h"
 #include "esp_mac.h"
 #include "soc/soc_caps.h"
 #if SOC_EMAC_IEEE1588V2_SUPPORTED
@@ -13,6 +15,7 @@
 #include "lwip/ip4_addr.h"
 #include "lwip/sockets.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *TAG = "eth_ts";
 
@@ -72,10 +75,15 @@ static bool extract_rx_ts(void *info, eth_ts_time_t *out)
     return t->seconds != 0 || t->nanoseconds != 0;
 }
 
+static volatile uint32_t s_rx_frames;      // every frame the EMAC delivered
+static uint32_t s_rx_kicks, s_rx_restarts, s_phy_resets;
+static uint32_t s_rx_dma_state, s_rx_missed, s_rx_fifo_ovf;
+
 static esp_err_t stack_input_info(esp_eth_handle_t eth, uint8_t *buffer,
                                   uint32_t length, void *priv, void *info)
 {
     (void)eth;
+    s_rx_frames++;
     const uint8_t *payload; uint32_t plen; uint16_t dport;
     if (s_ptp_cb && is_ptpv1_frame(buffer, length, &payload, &plen, &dport)) {
         eth_ts_ptp_frame_t f;
@@ -120,6 +128,14 @@ static void eth_event_handler(void *arg, esp_event_base_t base, int32_t id, void
 esp_err_t eth_ts_init(void)
 {
     eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
+    // EMAC RECEIVE TASK ABOVE EVERYTHING. IDF's default is 15, unpinned --
+    // below the I2S (23), audio RX (22) and PTP (21) tasks on core 0. Starved
+    // during a burst (two flows overlapping in a make-before-break repatch),
+    // the RX DMA ran out of descriptors and suspended, and since IDF wakes
+    // this task only on "frame received", receive never restarted: bench, RX
+    // dead for good while TX (heartbeats) carried on. It only copies frames
+    // out; running it first costs nothing.
+    mac_cfg.rx_task_prio = 24;
     eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
     phy_cfg.phy_addr    = AP_ETH_PHY_ADDR;
     phy_cfg.reset_gpio_num = AP_PIN_ETH_PHY_RST;
@@ -169,17 +185,45 @@ esp_err_t eth_ts_init(void)
                      esp_err_to_name(err));
             return err;
         }
-        EMAC_PTP.timestamp_ctrl.en_ts4all = 1;
-        ESP_LOGI(TAG, "IEEE 1588 timestamping enabled, all frames");
+        // Stamp ONLY PTPv1 event messages over UDP/IPv4 -- NOT every frame.
+        //
+        // This used to set en_ts4all, which stamps all frames, 1600+ audio
+        // packets a second included. Under the bursts of a flow change the
+        // MTL RX FIFO read controller hung in its "reading frame status /
+        // timestamp" state (EMACDEBUG RRCSTS = 2, RXFSTS = 3: FIFO full), the
+        // FIFO filled, and every later frame was dropped before the DMA --
+        // receive dead for good, TX alive, and no EMAC or PHY restart
+        // recovering it. The classifier below selects Sync (slave, event
+        // messages, IEEE 1588-2002 format) and stamps a few frames a second.
+        typeof(EMAC_PTP.timestamp_ctrl) tc = EMAC_PTP.timestamp_ctrl;
+        tc.en_ts4all                    = 0;
+        tc.en_ptp_pkg_proc_ver2_fmt     = 0;     // PTPv1 (1588-2002) messages
+        tc.en_proc_ptp_ether_frm        = 0;     // not PTP-over-Ethernet
+        tc.en_proc_ptp_ipv6_udp         = 0;
+        tc.en_proc_ptp_ipv4_udp         = 1;     // PTP over UDP/IPv4, ports 319/320
+        tc.en_ts_snap_event_msg         = 1;     // event messages only
+        tc.en_snap_msg_relevant_master  = 0;     // slave: stamp Sync
+        tc.sel_snap_type                = 0;
+        EMAC_PTP.timestamp_ctrl = tc;
+        ESP_LOGI(TAG, "IEEE 1588 timestamping enabled: PTPv1 Sync over UDP/IPv4 only");
     }
 #else
 #error "This target's EMAC has no IEEE 1588 unit -- a software timestamp is not good enough for a media clock."
 #endif
 
-    // 802.3x flow control. The AES67 work on this chip measured 8% multicast
-    // frame loss on the EMAC without it, which on a receiver presents as random
-    // dropouts and is very easy to blame on the jitter buffer instead.
-    bool fc = true;
+    // 802.3x flow control: OFF.
+    //
+    // It was on, because the AES67 work on this chip measured multicast frame
+    // loss without it. But with IDF's hardware flow control the MAC sends
+    // PAUSE whenever its RX FIFO fills, and a receive stall during a burst
+    // (flow changes: two flows overlapping, a flow stopped while packets are
+    // still in flight) became a DEADLOCK: the MAC kept pausing the switch, the
+    // switch forwarded nothing to this port, nothing drained the FIFO. On the
+    // bench every patch change could kill receive for good -- transmit still
+    // working, and no EMAC or PHY reset on our side recovering it. Without
+    // flow control an overload drops frames instead, which the jitter buffer
+    // and the flow liveness check handle.
+    bool fc = false;
     esp_eth_ioctl(s_eth, ETH_CMD_S_FLOW_CTRL, &fc);
 
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
@@ -242,10 +286,97 @@ static void eee_disable(void)
              (unsigned)adv, (unsigned)now, (unsigned)lp);
 }
 
+// ---------------------------------------------------------------------------
+// RECEIVE WATCHDOG. PTP alone brings ~8 frames/s, so a second with none while
+// the link is up means receive has stalled. First try a KICK: wake IDF's
+// emac_rx task so it drains whatever descriptors it is sitting on, and poke
+// the DMA's receive-poll register so a suspended DMA looks again. If that
+// does not bring frames back, restart the EMAC (which also drops and
+// re-acquires the IP -- ~10 s -- but beats a dead device).
+// ---------------------------------------------------------------------------
+#include "soc/emac_dma_struct.h"
+#include "soc/emac_mac_struct.h"
+
+static void rx_watchdog_task(void *arg)
+{
+    (void)arg;
+    uint32_t last = s_rx_frames;
+    int idle_ms = 0;
+    TaskHandle_t emac_rx = NULL;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        uint32_t now = s_rx_frames;
+        if (now != last || !s_link_up) { last = now; idle_ms = 0; continue; }
+        idle_ms += 250;
+        if (idle_ms == 1000) {
+            // What does the MAC see? RX DMA state + frames it had to drop.
+            uint32_t st = EMAC_DMA.dmastatus.recv_proc_state;
+            uint32_t mf = EMAC_DMA.dmamissedfr.missed_fc;       // read clears
+            uint32_t of = EMAC_DMA.dmamissedfr.overflow_fc;
+            s_rx_dma_state = st; s_rx_missed += mf; s_rx_fifo_ovf += of;
+            ESP_LOGW(TAG, "RX idle 1 s: dma state %u (3 wait, 4 SUSPENDED no-desc), "
+                          "missed %u, fifo overflow %u", (unsigned)st, (unsigned)mf, (unsigned)of);
+        }
+        if (idle_ms == 1000 || idle_ms == 2000) {
+            if (!emac_rx) emac_rx = xTaskGetHandle("emac_rx");
+            if (emac_rx) xTaskNotifyGive(emac_rx);
+            EMAC_DMA.dmarxpolldemand = 1;
+            s_rx_kicks++;
+            ESP_LOGW(TAG, "no RX for %d ms -- kicked emac_rx (#%u)", idle_ms,
+                     (unsigned)s_rx_kicks);
+        } else if (idle_ms == 4000) {
+            s_rx_restarts++;
+            ESP_LOGE(TAG, "RX still dead -- restarting EMAC (#%u)", (unsigned)s_rx_restarts);
+            esp_eth_stop(s_eth);
+            esp_eth_start(s_eth);
+        } else if (idle_ms >= 8000) {
+            // Even an EMAC restart did not help: the silence is below the MAC.
+            // Soft-reset the PHY (BMCR bit 15), put EEE back off, renegotiate.
+            s_phy_resets++;
+            ESP_LOGE(TAG, "RX dead after EMAC restart -- PHY soft reset (#%u)",
+                     (unsigned)s_phy_resets);
+            phy_wr(0, 0x8000);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            mmd_wr(7, 60, 0);
+            phy_wr(0, 0x1200);                 // AN enable + restart
+            idle_ms = 0;
+        }
+    }
+}
+
+uint32_t eth_ts_rx_kicks(void)    { return s_rx_kicks; }
+uint32_t eth_ts_rx_restarts(void) { return s_rx_restarts; }
+uint32_t eth_ts_phy_resets(void)  { return s_phy_resets; }
+// Raw MAC receive-side registers, healthy vs dead.
+void eth_ts_mac_dump(void)
+{
+    printf("  mac       config %08x  frame-filter %08x  debug %08x\n",
+           (unsigned)EMAC_MAC.gmacconfig.val, (unsigned)EMAC_MAC.gmacff.val,
+           (unsigned)EMAC_MAC.emacdebug.val);
+    printf("  mac addr0 %08x %08x\n", (unsigned)EMAC_MAC.emacaddr0high.val,
+           (unsigned)EMAC_MAC.emacaddr0low);
+    for (int i = 0; i < 15; i++) {
+        if (EMAC_MAC.emacaddr[i].emacaddrhigh.address_enable)
+            printf("  mac addr%-2d %08x %08x\n", i + 1,
+                   (unsigned)EMAC_MAC.emacaddr[i].emacaddrhigh.val,
+                   (unsigned)EMAC_MAC.emacaddr[i].emacaddrlow);
+    }
+}
+
+void eth_ts_rx_diag(uint32_t *dma_state_now, uint32_t *missed, uint32_t *fifo_ovf)
+{
+    *dma_state_now = EMAC_DMA.dmastatus.recv_proc_state;
+    uint32_t mf = EMAC_DMA.dmamissedfr.missed_fc, of = EMAC_DMA.dmamissedfr.overflow_fc;
+    s_rx_missed += mf; s_rx_fifo_ovf += of;
+    *missed = s_rx_missed; *fifo_ovf = s_rx_fifo_ovf;
+}
+
 esp_err_t eth_ts_start(void)
 {
     eee_disable();                   // before autonegotiation starts
-    return esp_eth_start(s_eth);
+    esp_err_t err = esp_eth_start(s_eth);
+    xTaskCreatePinnedToCore(rx_watchdog_task, "rx_wdog", 3072, NULL, 10, NULL, 1);
+    return err;
 }
 
 // Log the partner's EEE ability once the link is up (diagnostic).

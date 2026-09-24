@@ -161,6 +161,39 @@ one of the 10 TX descriptors, so the board lost sending capacity over about
 With the mutex on, stats replies come back in ≤ 0.02 s with no timeouts, and
 the keepalive counters (`rx_ka_sent`, `rx_ka_failed`) show 0 failures.
 
+### Receive: timestamp only what PTP needs
+
+IDF's PTP setup stamps only PTPv2-over-Ethernet frames, so PTPv1 needs its own
+classifier setting. The first version set **`en_ts4all`** (timestamp every
+frame, 1,600+ audio packets a second included). Under the bursts of a patch
+change, the MAC's RX FIFO read controller then **hung while transferring a
+frame's timestamp**:
+
+| `EMACDEBUG` | healthy | dead |
+|---|---|---|
+| RX FIFO read controller | idle | stuck in "reading frame status / timestamp" |
+| RX FIFO fill level | empty | **full** |
+
+From then on every frame was dropped before the DMA. Receive was dead for good,
+transmit still worked, and the DMA looked healthy ("waiting for packets", free
+descriptors). No EMAC restart and no PHY reset recovered it.
+
+`eth_ts.c` now stamps **only PTPv1 event messages over UDP/IPv4**
+(`en_proc_ptp_ipv4_udp`, version-1 format, event messages, slave role): a few
+frames a second. Measured afterwards: 18 subscribe/unsubscribe changes in a row
+with 0 failed requests, correct status after every step, and PTP locked
+throughout with `no_hw_ts = 0`.
+
+Two related settings, both kept:
+
+- **802.3x flow control is off.** With the MAC's hardware flow control, a
+  receive stall keeps the switch paused, which turns a hiccup into a deadlock.
+- **Receive watchdog** (`eth_ts.c`): if the link is up and no frame arrives for
+  1 s (PTP alone brings ~8/s), it wakes IDF's `emac_rx` task and pokes the RX
+  poll demand; then restarts the EMAC; then soft-resets the PHY. Counters:
+  `eth_rx_kicks`, `eth_rx_restarts`, `eth_phy_resets`. It is a safety net, and
+  it did **not** recover the timestamp hang; the fix above is what matters.
+
 ## Clocking
 
 **SCKI = BCK = 256 fS = 12.288 MHz, format `FMTDA = 1000`** (24-bit high-speed
@@ -282,6 +315,14 @@ Receiving a flow:
   silently fails to send is invisible otherwise.
 - **Liveness**: a flow whose packet count stops for 3 s is torn down and
   re-requested.
+- **Status must be current**: a rebuild works on a snapshot and can take
+  seconds. It only marks a channel active or pending if that channel's
+  subscription is still the one it worked on; otherwise an unsubscribe made
+  mid-rebuild "came back" in the controller.
+- **If a transmitter refuses the replacement flow** (the virtual soundcard
+  sometimes answers `0x0301` to a second, overlapping flow), the old flow is
+  stopped first and the request repeated: a short gap instead of a stuck patch
+  (`flow_fallbacks`).
 - **Exact packet size**: a packet must be exactly `fpp × channels × 3` bytes,
   or it is dropped (`rx_wrong_len`). Checking only divisibility would let a
   packet in a flow's previous layout be misread during a change.
@@ -361,6 +402,9 @@ The fields that matter most:
 | `jb_underrun_frames`, `jb_pkt_late` | buffer health (underruns also count silence before a flow exists) |
 | `rx_packets`, `flow_ka_ok/lost` | flow health (the `ka` counters are the liveness checks) |
 | `rx_ka_sent`, `rx_ka_failed`, `rx_ka_errno` | flow keepalives sent / refused by the stack; failures mean transmit trouble |
+| `fc_last_op`, `fc_last_code`, `fc_refused`, `fc_timeouts`, `flow_fallbacks` | flow-control requests: last opcode and the transmitter's answer (`0xFFFF` no reply, `0xFFFE` could not send) |
+| `eth_rx_kicks`, `eth_rx_restarts`, `eth_phy_resets` | receive watchdog actions (should stay 0) |
+| `reset_reason` | why the board last started: 1 power-on, 3 software, 4 panic, 5–7 watchdog, 9 brown-out |
 | `peak_in_dbfs`, `peak_out_dbfs` | per-channel level from the network and to the DAC, since last read |
 
 The telemetry **stream** (UDP 7778, sent to whoever last queried 7779) carries
@@ -370,6 +414,12 @@ to see what PTP is doing sample by sample.
 
 `peak_in` against `peak_out` is the quickest fault split: signal in both and
 silence at the jack means the DAC side.
+
+The console's `s` status also prints heap (internal / DMA), the `emac_rx`
+task state, the RX DMA state with missed / FIFO-overflow counts, and the raw MAC
+config, frame-filter, debug and address-filter registers. That is how the
+receive hang above was found. **Opening the serial port can hold this board in
+reset**; send `s`, read, and close again rather than leaving it open.
 
 Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
 `r` re-anchor, `n <name>` rename, `k` refresh subscriptions, `m 0/1` mute.

@@ -29,6 +29,14 @@
 #define FLOW_HANDLE_LEN 6
 
 typedef struct {
+    uint16_t last_opcode;       // 0x0100 request, 0x0101 stop, 0x0102 update
+    uint16_t last_code;         // transmitter's opcode2 on refusal; 0xFFFF = no reply
+    uint32_t refused;
+    uint32_t timeouts;
+} flows_client_diag_t;
+extern flows_client_diag_t g_flows_diag;
+
+typedef struct {
     uint32_t tx_ip;                              // transmitter, host order
     uint16_t tx_flow_port;                       // from the channel's SRV (4455)
     uint16_t tx_channel_id[AP_MAX_CH_PER_FLOW];  // 0 = unused slot

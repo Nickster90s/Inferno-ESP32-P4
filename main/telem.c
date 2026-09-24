@@ -1,4 +1,6 @@
 #include "telem.h"
+#include "eth_ts.h"
+#include "esp_system.h"
 #include <math.h>
 #include "app_config.h"
 #include "rate.h"
@@ -8,6 +10,7 @@
 #include "jitterbuf.h"
 #include "aoip_rx.h"
 #include "subscriber.h"
+#include "flows_client.h"
 #include "audio_out.h"
 #include "aoip_wire.h"
 #include "lwip/sockets.h"
@@ -74,6 +77,10 @@ static int build_stats(char *out, size_t cap)
     int n = snprintf(out, cap,
         "v=3\n"
         "uptime_ms=%u\n"
+        "reset_reason=%d\n"
+        "eth_rx_kicks=%u\n"
+        "eth_rx_restarts=%u\n"
+        "eth_phy_resets=%u\n"
         "rate_hz=%u\n"
         "rate_pin=%d\n"
         "rate_pinned=%d\n"
@@ -119,14 +126,24 @@ static int build_stats(char *out, size_t cap)
         "rx_ka_sent=%u\n"
         "rx_ka_failed=%u\n"
         "rx_ka_errno=%d\n"
+        "fc_last_op=%u\n"
+        "fc_last_code=%u\n"
+        "fc_refused=%u\n"
+        "fc_timeouts=%u\n"
         "flows_active=%u\n"
         "flow_req_ok=%u\n"
         "flow_req_failed=%u\n"
         "flow_ka_ok=%u\n"
         "flow_ka_lost=%u\n"
         "resolve_failed=%u\n"
+        "flow_fallbacks=%u\n"
         "audio_blocks=%u\n",
         (unsigned)(esp_timer_get_time() / 1000),
+        // esp_reset_reason_t: 1 power-on, 3 software, 4 PANIC, 5 int WDT,
+        // 6 task WDT, 7 other WDT, 9 brown-out. Anything but 1/3 after a
+        // silent reboot is a crash, and says which kind.
+        (int)esp_reset_reason(),
+        (unsigned)eth_ts_rx_kicks(), (unsigned)eth_ts_rx_restarts(), (unsigned)eth_ts_phy_resets(),
         (unsigned)rate_hz(), rate_pin_level(), (int)rate_is_pinned(),
         (unsigned)rate_get()->fpp,
         g_ptpv1.locked, g_ptpv1.have_master,
@@ -150,9 +167,11 @@ static int build_stats(char *out, size_t cap)
         (unsigned)rx.packets, (unsigned)rx.bad_magic, (unsigned)rx.short_pkt,
         (unsigned)rx.wrong_len,
         (unsigned)rx.ka_sent, (unsigned)rx.ka_failed, (int)rx.ka_last_errno,
+        (unsigned)g_flows_diag.last_opcode, (unsigned)g_flows_diag.last_code,
+        (unsigned)g_flows_diag.refused, (unsigned)g_flows_diag.timeouts,
         (unsigned)sub.flows_active, (unsigned)sub.requests_ok,
         (unsigned)sub.requests_failed, (unsigned)sub.keepalives_ok,
-        (unsigned)sub.keepalives_lost, (unsigned)sub.resolve_failed,
+        (unsigned)sub.keepalives_lost, (unsigned)sub.resolve_failed, (unsigned)sub.fallbacks,
         (unsigned)audio_out_blocks());
     if (n < 0 || (size_t)n >= cap) return n;
 

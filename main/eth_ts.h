@@ -45,6 +45,14 @@ typedef void (*eth_ts_ptp_cb_t)(const eth_ts_ptp_frame_t *f);
 
 esp_err_t eth_ts_init(void);
 esp_err_t eth_ts_start(void);
+
+// Receive watchdog counters (see eth_ts.c).
+uint32_t eth_ts_rx_kicks(void);
+uint32_t eth_ts_rx_restarts(void);
+uint32_t eth_ts_phy_resets(void);
+// RX DMA state now, and cumulative missed / FIFO-overflow frame counts.
+void eth_ts_mac_dump(void);
+void eth_ts_rx_diag(uint32_t *dma_state_now, uint32_t *missed, uint32_t *fifo_ovf);
 bool      eth_ts_link_up(void);
 const uint8_t *eth_ts_mac(void);
 esp_netif_t   *eth_ts_netif(void);

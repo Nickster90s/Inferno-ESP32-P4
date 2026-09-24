@@ -12,6 +12,10 @@ static const char *TAG = "flows_cli";
 
 static uint16_t s_seq = 1;
 
+// Last outcome of each control call, for telemetry: the console is not always
+// readable (opening the port can hold this board in reset).
+flows_client_diag_t g_flows_diag;
+
 // ---------------------------------------------------------------------------
 // Transaction
 // ---------------------------------------------------------------------------
@@ -42,6 +46,8 @@ static esp_err_t transact(uint32_t ip, uint16_t port, uint16_t opcode1,
 
     if (sendto(s, pkt, total, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
         close(s);
+        g_flows_diag.last_opcode = opcode1;
+        g_flows_diag.last_code   = 0xFFFE;      // could not even send
         return ESP_FAIL;
     }
 
@@ -57,6 +63,9 @@ static esp_err_t transact(uint32_t ip, uint16_t port, uint16_t opcode1,
         uint16_t op2 = dw_rd16(rb + 8);
         close(s);
         if (op2 != DRR_CODE_OK) {
+            g_flows_diag.last_opcode = opcode1;
+            g_flows_diag.last_code   = op2;
+            g_flows_diag.refused++;
             ESP_LOGW(TAG, "transmitter refused opcode 0x%04x: 0x%04x",
                      opcode1, op2);
             return (op2 == DRR_ERR_FLOW_EXPIRED) ? ESP_ERR_NOT_FOUND : ESP_FAIL;
@@ -70,6 +79,9 @@ static esp_err_t transact(uint32_t ip, uint16_t port, uint16_t opcode1,
     }
 
     close(s);
+    g_flows_diag.last_opcode = opcode1;
+    g_flows_diag.last_code   = 0xFFFF;          // no reply
+    g_flows_diag.timeouts++;
     return ESP_ERR_TIMEOUT;
 }
 
