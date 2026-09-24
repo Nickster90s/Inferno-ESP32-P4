@@ -19,11 +19,11 @@ virtual soundcard (DVS) on a Mac as the transmitter:
 | | |
 |---|---|
 | discovery | appears in AoIP Controller with name, model, IP, 8 RX channels |
-| clock | PTPv1 locked, Sync **green about 17 s after power-on** |
+| clock | PTPv1 locked, Sync **green about 15 s after power-on** |
 | subscription | patch goes **green**; restored from flash after a reboot |
 | patching | adding or removing a channel causes **0 underruns** on channels already playing |
 | audio | DVS → P4 → PCM1690 → jack, heard on J5 |
-| long run | see [Measured](#measured) |
+| long run | see [Measured](#measured); a soak test after the transmit fix below is in progress |
 
 Open issues are listed under [Known issues](#known-issues).
 
@@ -117,6 +117,27 @@ Three properties hold the design together:
 - **One controller per buffer.** The media clock's phase loop is the only thing
   that acts on the buffer. The feed-forward term (below) is a rate, taken from
   the PTP servo, and never looks at the buffer.
+
+### Transmit: one descriptor ring, two cores
+
+**`CONFIG_ETH_TRANSMIT_MUTEX=y` is required** (`sdkconfig.defaults`). The PTP
+task on core 0 sends Delay_Req with `esp_eth_transmit_ctrl_vargs()` to get a
+hardware TX timestamp. lwIP transmits from its own thread on core 1. IDF
+leaves the transmit mutex **off** by default, so without it both cores write
+the EMAC's TX descriptor ring at the same time.
+
+On the bench that failed slowly rather than at once. Each collision spoiled
+one of the 10 TX descriptors, so the board lost sending capacity over about
+70 minutes:
+
+| since boot | symptom |
+|---|---|
+| minutes | stats replies slow (> 0.4 s) and about half time out; unicast ARP probes unanswered |
+| ~0–41 min | 7 audio flow drops of ~3 s each (keepalives not getting out) |
+| ~68 min | nothing can be sent: no ping, no heartbeat, flow requests fail in 1 ms, **audio gone**. Receive still works (PTP Sync keeps counting) |
+
+With the mutex on, stats replies come back in ≤ 0.02 s with no timeouts, and
+the keepalive counters (`rx_ka_sent`, `rx_ka_failed`) show 0 failures.
 
 ## Clocking
 
@@ -234,7 +255,9 @@ Receiving a flow:
   one flow per transmitter, carrying every channel subscribed to it.
 - **Keepalive**: `13 37`, every 250 ms, **from the audio socket to the audio
   source address**. Opcode `0x0102` is not a keepalive. A transmitter drops a
-  flow after ~4 s without the real one.
+  flow after ~4 s without the real one. Every `sendto()` is checked and
+  counted (`rx_ka_sent` / `rx_ka_failed` / `rx_ka_errno`); a keepalive that
+  silently fails to send is invisible otherwise.
 - **Liveness**: a flow whose packet count stops for 3 s is torn down and
   re-requested.
 - **Exact packet size**: a packet must be exactly `fpp × channels × 3` bytes,
@@ -315,6 +338,7 @@ The fields that matter most:
 | `mclk_error_frames`, `mclk_reset_steps` | playout phase; steps are audible |
 | `jb_underrun_frames`, `jb_pkt_late` | buffer health (underruns also count silence before a flow exists) |
 | `rx_packets`, `flow_ka_ok/lost` | flow health (the `ka` counters are the liveness checks) |
+| `rx_ka_sent`, `rx_ka_failed`, `rx_ka_errno` | flow keepalives sent / refused by the stack; failures mean transmit trouble |
 | `peak_in_dbfs`, `peak_out_dbfs` | per-channel level from the network and to the DAC, since last read |
 
 The telemetry **stream** (UDP 7778, sent to whoever last queried 7779) carries
@@ -352,21 +376,27 @@ Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
 
 ## Known issues
 
-1. **The ~36 µs shift in path delay when a flow starts is unexplained.** The
+1. **Long-run confirmation of the transmit fix is pending.** Before the fix the
+   board lost all transmit after ~68 minutes; a 90-minute soak is running.
+2. **Sync can blink red for ~5 s after a phase-shift correction** (seen at 35 s
+   and 201 s after boot). The audio is unaffected, since the DAC clock follows
+   the rate, not the offset. Likely the re-measured path delay moving the
+   offset past the 5 µs unlock threshold; not yet fixed.
+3. **The ~36 µs shift in path delay when a flow starts is unexplained.** The
    servo now absorbs it. A side effect: PTPv1 assumes a symmetric path, so if
    the change is only in the Leader-to-us direction, our clock sits a
    constant ~18 µs off the Leader. That is harmless for playout, but it is a
    real offset against other devices.
-2. **The phase loop is disarmed by default**, so playout sits a constant few
+4. **The phase loop is disarmed by default**, so playout sits a constant few
    milliseconds away from the target latency.
-3. **Flow drops under heavy console logging.** Each log line blocks a core-0
+5. **Flow drops under heavy console logging.** Each log line blocks a core-0
    task for ~10 ms of UART time. With per-sample PTP tracing on, the flow was
    lost six times in two minutes, so tracing is compiled out
    (`AP_PTP_TRACE=0`). Use the telemetry stream (UDP 7778) for per-sample
    data: it does not block.
-4. **The heartbeat meters are zeros**, so the controller shows no levels. The
+6. **The heartbeat meters are zeros**, so the controller shows no levels. The
    board now has real per-channel peaks to report.
-5. **48 kHz only** (see above).
+7. **48 kHz only** (see above).
 
 ## Lessons carried across
 
@@ -380,3 +410,9 @@ Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
 - When a working reference exists for the same hardware, match it before
   reasoning from the datasheet: the DAC stayed silent until the clocking
   matched `p4-uac-pcm1690` exactly.
+- Anything that calls into a driver from a second task needs that driver's
+  locking checked, not assumed. The transmit race took 70 minutes to kill
+  the board and looked like network trouble, ARP trouble and a flaky
+  transmitter along the way.
+- A counter on every "can't fail" call (`sendto()` for a keepalive) turns an
+  invisible fault into a number.
