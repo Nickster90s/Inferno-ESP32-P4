@@ -1,0 +1,52 @@
+CONFIG_IDF_TARGET="esp32p4"
+
+# --- Partition table -------------------------------------------------------
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# Waveshare ESP32-P4-ETH carries 16 MB of NOR flash; the 2 MB default cannot
+# hold the 2 MB factory partition.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# --- CPU -------------------------------------------------------------------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_UNICORE=n
+
+# --- Ethernet: internal EMAC + IP101 over RMII ------------------------------
+CONFIG_ETH_USE_ESP32_EMAC=y
+CONFIG_ETH_PHY_INTERFACE_RMII=y
+# The Waveshare ESP32-P4-ETH feeds 50 MHz into GPIO50 from an external
+# oscillator. This is load-bearing: if the RMII clock were generated from the
+# internal APLL, the APLL would be unavailable as the media clock and this
+# whole design would need an external clock generator instead.
+# On the P4 the RMII clock is NOT a Kconfig option (CONFIG_ETH_RMII_CLK_* is
+# ESP32-only in IDF 5.5); it is set in eth_ts.c from AP_PIN_ETH_REF_CLK.
+CONFIG_ETH_DMA_BUFFER_SIZE=1600
+CONFIG_ETH_DMA_RX_BUFFER_NUM=20
+CONFIG_ETH_DMA_TX_BUFFER_NUM=10
+# IEEE 1588 has no Kconfig switch in IDF 5.5 -- it is SOC_EMAC_IEEE1588V2_SUPPORTED
+# and enabled at runtime in eth_ts.c.
+
+# --- lwIP ------------------------------------------------------------------
+# IGMP is not optional: without it the switch stops forwarding our groups.
+CONFIG_LWIP_IGMP=y
+CONFIG_LWIP_IPV6=n
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+CONFIG_LWIP_TCPIP_TASK_PRIO=18
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_LWIP_AUTOIP=y
+CONFIG_LWIP_DHCP_RESTORE_LAST_IP=y
+
+# --- mDNS ------------------------------------------------------------------
+CONFIG_MDNS_MAX_SERVICES=64
+CONFIG_MDNS_TASK_AFFINITY_CPU1=y
+
+# --- esp_timer ---------------------------------------------------------------
+# mclk_hw.c's sigma-delta dither runs as an ESP_TIMER_ISR callback at 1 kHz.
+CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
+
+# --- Logging ---------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
