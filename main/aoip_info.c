@@ -5,10 +5,12 @@
 // RECEIVER (8 rx channels, no tx) and those differences are called out.
 
 #include "aoip_info.h"
+#include "reqlog.h"
 #include "aoip_wire.h"
 #include "eth_ts.h"
 #include "ptpv1.h"
 #include "rate.h"
+#include "aoip_rx.h"
 #include "app_config.h"
 #include "lwip/sockets.h"
 #include "esp_netif.h"
@@ -159,7 +161,9 @@ static void send_heartbeat(void)
     put_u16(p, n + 12, nflows); put_u16(p, n + 14, 0);
     put_u16(p, n + 16, 0x0018); put_u16(p, n + 18, 0);
     put_u32(p, n + 20, rate_hz());
-    memset(p + n + 24, 0, 4 * nflows);        // TODO: measured per-flow latency
+    // One word per flow SLOT -- the same index as 0x3200's flow id - 1:
+    // measured latency in samples (aoip_rx.c), as inferno sends it.
+    for (uint16_t i = 0; i < nflows; i++) put_u32(p, n + 24 + 4 * i, aoip_rx_take_latency((uint8_t)i));
     n += 24 + 4 * nflows;
 
     put_u16(p, n, (uint16_t)(20 + 4 * nflows)); put_u16(p, n + 2, 0x8004);
@@ -187,6 +191,13 @@ static void send_device_info(const uint8_t ip[4], uint16_t port)
     c[0] = 4; c[1] = 1; c[2] = 0; c[3] = 6;           // firmware version
     c[4] = 4; c[5] = 1; c[6] = 0; c[7] = 3;           // hardware version
     c[0x16] = 0x10;                                   // has manufacturer name
+    // CONFIGURATION CAPABILITIES (inferno: "identify / sample-rate & encoding
+    // config / reboot / factory reset"). 0 made the controller say "This
+    // device does not support sample rate configuration". 0xdb is a RedNet
+    // AM2's value, read off this bench; which bit is which is not known, so
+    // it may also advertise identify / reboot / factory reset -- their
+    // commands land in the request log (reqlog.c) if the controller sends them.
+    c[0x17] = 0xdb;
     c[0x23] = 2; c[0x27] = 1; c[0x28] = 1;
     c[0xbb] = 0x1f;
     put_fixed(c, 0x0c, 8,  "NSerAoI");
@@ -300,18 +311,85 @@ static void send_clock_stats(const uint8_t *req)
 
 // 0x0080 sample rates, 0x0082 encodings, 0x1009, 0x0084. Declares only what
 // this device can do: ONE rate (the one the boot pin chose) and 24-bit.
+// 0x0080 rate table: item size, count, CURRENT rate, the same rate again,
+// 0x0002 0x0000, then the supported rates -- a RedNet AM2's layout, captured
+// while its rate was switched 48 -> 96 -> 44.1 kHz. `req` non-NULL makes this
+// a REPLY: the request's seq and opcode are echoed (byte 3 -> 0x80), as the
+// controller correlates replies that way (see send_clock_stats).
+static const uint32_t RATES[] = { 48000, 96000 };
+
+static void send_rate_table(const uint8_t ip[4], uint16_t port, const uint8_t *req,
+                            uint32_t hz)
+{
+    static const uint8_t op_default[8] = {0x07, 0x2a, 0x00, 0x80, 0, 0, 0, 0};
+    uint8_t op[8];
+    uint16_t seq = s_seq;
+    memcpy(op, op_default, 8);
+    if (req) { memcpy(op, req + 24, 8); op[3] = 0x80; seq = (uint16_t)((req[4] << 8) | req[5]); }
+    uint32_t n = put_hdr_seq(s_buf, 0xFFFF, op, seq);
+    uint8_t *c = s_buf + n;
+    const uint16_t nr = sizeof(RATES) / sizeof(RATES[0]);
+    put_u16(c, 0, 0x0018); put_u16(c, 2, nr);
+    put_u32(c, 4, hz); put_u32(c, 8, hz);
+    put_u16(c, 12, 2); put_u16(c, 14, 0);
+    for (uint16_t i = 0; i < nr; i++) put_u32(c, 16 + 4 * i, RATES[i]);
+    send_to(ip, port, n + 16 + 4 * nr);
+}
+
+// ---------------------------------------------------------------------------
+// SAMPLE RATE SET. Captured from the controller choosing 44.1 kHz for this
+// device: an info request with opcode byte 3 = 0x81 -- the same opcode as the
+// rate QUERY -- but carrying content:
+//     u32 1          (set)
+//     u32 rate       (0x0000ac44 = 44100)
+// The controller only offers this once board info byte 0x17 advertises
+// configuration capability. On a switch a RedNet AM2 multicasts the new rate
+// table, then 0x0100 (01 01 00 00 00 00 00 02) and 0x0106 (empty); we do the
+// same, store the rate, and restart onto it -- the whole clock chain is set up
+// at boot. PTP re-locks in ~15 s.
+// ---------------------------------------------------------------------------
+#include "esp_system.h"
+static esp_timer_handle_t s_restart_timer;
+
+static void restart_cb(void *arg) { (void)arg; esp_restart(); }
+
+static void handle_rate_set(const uint8_t *req, int len)
+{
+    uint32_t hz = ((uint32_t)req[36] << 24) | ((uint32_t)req[37] << 16) |
+                  ((uint32_t)req[38] << 8)  |  (uint32_t)req[39];
+    if (hz == rate_hz()) {
+        send_rate_table(GRP_DEVINFO, AOIP_PORT_INFO, req, hz);
+        return;
+    }
+    esp_err_t err = rate_request(hz);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "rate %u Hz refused (%s)", (unsigned)hz, esp_err_to_name(err));
+        send_rate_table(GRP_DEVINFO, AOIP_PORT_INFO, req, rate_hz());
+        return;
+    }
+    ESP_LOGW(TAG, "rate -> %u Hz requested by the controller: restarting", (unsigned)hz);
+    send_rate_table(GRP_DEVINFO, AOIP_PORT_INFO, req, hz);
+    {
+        static const uint8_t op[8] = {0x07, 0x2a, 0x01, 0x00, 0, 0, 0, 0};
+        static const uint8_t body[8] = {0x01, 0x01, 0, 0, 0, 0, 0, 0x02};
+        uint32_t n = put_hdr(s_buf, 0xFFFF, op);
+        memcpy(s_buf + n, body, sizeof(body));
+        send_to(GRP_DEVINFO, AOIP_PORT_INFO, n + sizeof(body));
+    }
+    {
+        static const uint8_t op[8] = {0x07, 0x2a, 0x01, 0x06, 0, 0, 0, 0};
+        send_to(GRP_DEVINFO, AOIP_PORT_INFO, put_hdr(s_buf, 0xFFFF, op));
+    }
+    if (!s_restart_timer) {
+        const esp_timer_create_args_t a = { .callback = restart_cb, .name = "rate_rst" };
+        esp_timer_create(&a, &s_restart_timer);
+    }
+    esp_timer_start_once(s_restart_timer, 500000);   // let the replies get out
+}
+
 static void send_caps(const uint8_t ip[4], uint16_t port)
 {
-    {
-        static const uint8_t op[8] = {0x07, 0x2a, 0x00, 0x80, 0, 0, 0, 0};
-        uint32_t n = put_hdr(s_buf, 0xFFFF, op);
-        uint8_t *c = s_buf + n;
-        put_u16(c, 0, 0x0018); put_u16(c, 2, 1);
-        put_u32(c, 4, rate_hz()); put_u32(c, 8, 0);
-        put_u16(c, 12, 0); put_u16(c, 14, 0);
-        put_u32(c, 16, rate_hz());
-        send_to(ip, port, n + 20);
-    }
+    send_rate_table(ip, port, NULL, rate_hz());
     {
         static const uint8_t op[8] = {0x07, 0x2a, 0x00, 0x82, 0, 0, 0, 0};
         uint32_t n = put_hdr(s_buf, 0xFFFF, op);
@@ -375,13 +453,20 @@ static void info_rx(const uint8_t *req, int len, const struct sockaddr_in *from)
     memcpy(src, &from->sin_addr.s_addr, 4);
     uint16_t sport = ntohs(from->sin_port);
 
+    reqlog_add("info", from->sin_addr.s_addr, req, len);
     uint8_t q = req[24 + 3];
     switch (q) {
     case 0x60: case 0x61: send_device_info(src, sport);  break;
     case 0xc0: case 0xc1: send_product_info(src, sport); break;
     case 0x13:            send_network_info(src, sport); break;
     case 0x21:            send_clock_stats(req);         break;
-    case 0x81: case 0x83: case 0x85: send_caps(src, sport); break;
+    case 0x81:
+        // With content it is a SET (u32 1, u32 rate); without, a query.
+        if (len >= MCAST_HDR_LEN + 8 && req[32] == 0 && req[33] == 0 &&
+            req[34] == 0 && req[35] == 1) { handle_rate_set(req, len); break; }
+        send_caps(src, sport);
+        break;
+    case 0x83: case 0x85: send_caps(src, sport); break;
     default: {
         static uint64_t seen;
         uint64_t bit = 1ULL << (q & 63);
@@ -420,6 +505,7 @@ static void cmc_task(void *arg)
         if (n < (int)DRR_HDR_LEN) continue;
         if (dw_rd16(rx + 8) != 0 || dw_rd16(rx + 6) != OP_CMC_DEVICE_ADVERTISEMENT) {
             ESP_LOGW(TAG, "cmc: unhandled opcode 0x%04x", dw_rd16(rx + 6));
+            reqlog_add("cmc", from.sin_addr.s_addr, rx, n);
             continue;
         }
         uint8_t ip[4];

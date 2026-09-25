@@ -50,4 +50,15 @@ typedef struct {
 
 void subscriber_get_stats(subscriber_stats_t *out);
 
+// Active receive flows, for the controller's flow list (ARC 0x3200) -- which
+// is what its Latency tab lists as "Receive Connections".
+typedef struct {
+    uint8_t  slot;                               // flow slot = aoip_rx flow index
+    uint16_t rx_port;                            // our socket for this flow
+    uint8_t  nslots;
+    int8_t   slot_to_ch[AP_MAX_CH_PER_FLOW];     // flow slot -> local channel, -1 none
+} subscriber_flow_t;
+
+int subscriber_get_flows(subscriber_flow_t *out, int max);
+
 #endif // SUBSCRIBER_H

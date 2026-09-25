@@ -16,6 +16,7 @@ idf_component_register(
         "aoip_arc.c"
         "aoip_msg.c"
         "aoip_info.c"
+        "reqlog.c"
         "aoip_mdns.c"
         "subscriber.c"
         "telem.c"

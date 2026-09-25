@@ -50,8 +50,18 @@ void mclk_anchor(void);
 void mclk_arm(bool on);
 bool mclk_is_armed(void);
 
-void     mclk_set_latency_us(uint32_t us);
-uint32_t mclk_get_latency_us(void);
+// Latency, three numbers -- as a real device keeps them apart:
+//   CONFIGURED  the device setting, chosen in the controller (0x1101), kept in
+//               NVS. What the controller shows as "Device Latency"; anything
+//               else it calls "custom".
+//   FLOOR       what the transmitters we receive from ask for (their
+//               advertised latency). A DVS asks for 4 ms or more.
+//   EFFECTIVE   max(configured, floor, this build's minimum) -- what playout
+//               actually runs at, and what a receive flow reports.
+void     mclk_set_latency_us(uint32_t us);       // configured; persisted
+uint32_t mclk_get_config_latency_us(void);
+void     mclk_set_latency_floor_us(uint32_t us); // from the subscriber
+uint32_t mclk_get_latency_us(void);              // effective
 
 // Called from the audio task, once per I2S block. Runs the PI loop at
 // AP_MCLK_UPDATE_HZ and does nothing on the other calls.

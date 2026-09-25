@@ -220,7 +220,8 @@
 // Frames per DMA descriptor, and descriptor count.
 //
 // Sized by TIME so the audio task wakes at 3000 Hz at either sample rate:
-// 16 frames at 48 kHz, 32 at 96 kHz, 1/3 ms each way.
+// 16 frames at 48 kHz, 32 at 96 kHz, 1/3 ms each way. (16 at 96 kHz, for a
+// 1 ms latency minimum, was tried and failed -- rate.c.)
 //
 // 16 IS THE FLOOR, not a round number. The Espressif AES67 work on this same
 // chip found DMA descriptors smaller than 16 frames unreliable under load, so
@@ -337,6 +338,10 @@
 
 #define AP_CORE_AUDIO       0
 #define AP_CORE_CONTROL     1
+// NOT core 1 for aoip_rx / ptpv1: above lwIP's tcpip thread (18) on the SAME
+// core, select() reported a socket readable that tcpip had not finished
+// delivering, recvfrom() found nothing, and the loop spun -- tcpip starved,
+// task watchdog on IDLE1, audio gone. On core 0 they run alongside tcpip.
 
 #define AP_PRIO_I2S         23
 #define AP_PRIO_RX          22

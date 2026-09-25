@@ -21,6 +21,7 @@ typedef struct {
     uint32_t ka_sent;           // flow keepalives handed to lwIP
     uint32_t ka_failed;         // ... that sendto() refused
     int32_t  ka_last_errno;
+    int32_t  lat_max_samples;   // max (now - timestamp) since boot
 } aoip_rx_stats_t;
 
 esp_err_t aoip_rx_start(void);
@@ -44,5 +45,9 @@ void aoip_rx_get_stats(aoip_rx_stats_t *out);
 // Peak |sample| per DAC channel since the last call, 24-bit full scale 2^23.
 void aoip_rx_take_peaks(uint32_t out[AP_NCH]);
 uint32_t aoip_rx_flow_packets(uint8_t idx);
+
+// Flow idx's highest (now - packet timestamp) in samples since the last call,
+// then reset -- the per-flow latency the heartbeat reports. 0 if inactive.
+uint32_t aoip_rx_take_latency(uint8_t idx);
 
 #endif // AOIP_RX_H

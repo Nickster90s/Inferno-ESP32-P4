@@ -3,6 +3,8 @@
 #include "aoip_wire.h"
 #include "jitterbuf.h"
 #include "telem.h"
+#include "media_clock.h"
+#include "ptpv1.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
@@ -21,6 +23,7 @@ typedef struct {
     uint16_t fpp;
     uint16_t port;
     uint32_t packets;
+    volatile int32_t lat_max;       // max (now - timestamp) at receipt, samples
     struct sockaddr_in src;         // where this flow's audio comes FROM
     bool     have_src;
 } flow_t;
@@ -71,6 +74,22 @@ static void handle_packet(flow_t *fl, const uint8_t *buf, int len)
     uint32_t nframes = fl->fpp;
 
     uint64_t idx = aoip_ts_to_samples(h.seconds, h.subsec_samples, rate_hz());
+
+    // ACTUAL LATENCY, the controller's number: now - timestamp at receipt,
+    // kept as a running max until the heartbeat takes it (inferno
+    // flows_rx.rs:122; FPGA docs/LATENCY.md 8). A timestamp in the future
+    // clamps to 0, as there. Only while PTP is LOCKED, and nothing over
+    // 50 ms (the protocol maximum is 40): across a PTP step or phase shift `now`
+    // jumps and the difference is the step, not the network (seen: 100-144 ms
+    // in the seconds after lock).
+    uint64_t now;
+    if (g_ptpv1.locked && mclk_now_samples(&now)) {
+        int64_t d = (int64_t)(now - idx);
+        if (d > (int64_t)(rate_hz() / 20)) d = 0;
+        if (d > fl->lat_max) fl->lat_max = (int32_t)d;
+        if (d > s_st.lat_max_samples) s_st.lat_max_samples = (int32_t)d;
+    }
+
     jb_write(idx, nframes, nslots, map, h.samples);
 
     // Input meter: what the transmitter actually sent. Silence here and the
@@ -228,6 +247,13 @@ void aoip_rx_get_stats(aoip_rx_stats_t *out) { *out = s_st; }
 void aoip_rx_take_peaks(uint32_t out[AP_NCH])
 {
     for (int c = 0; c < AP_NCH; c++) { out[c] = s_peak_in[c]; s_peak_in[c] = 0; }
+}
+
+uint32_t aoip_rx_take_latency(uint8_t idx)
+{
+    if (idx >= AP_MAX_FLOWS || !s_flows[idx].active) return 0;
+    int32_t v = __atomic_exchange_n(&s_flows[idx].lat_max, 0, __ATOMIC_RELAXED);
+    return v > 0 ? (uint32_t)v : 0;
 }
 
 uint32_t aoip_rx_flow_packets(uint8_t idx)

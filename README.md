@@ -8,7 +8,7 @@ and disciplines its conversion clock to the network.
 
 **Board:** Waveshare ESP32-P4-ETH (ESP32-P4, IP101 PHY, 100 Mbit/s, CH343 USB-UART)
 **DAC:** PCM1690 breakout, 24-bit, 8 line outputs on 4 × 3.5 mm jacks
-**Rate:** 48 kHz (see [Why 48 kHz](#why-48-khz))
+**Rate:** 48 or 96 kHz, chosen in the controller (see [Sample rates](#sample-rates-48-and-96-khz-chosen-in-the-controller))
 **Toolchain:** ESP-IDF v5.5
 
 ## Status: working end to end
@@ -23,6 +23,8 @@ virtual soundcard (DVS) on a Mac as the transmitter:
 | subscription | patch goes **green**; restored from flash after a reboot |
 | patching | adding or removing a channel causes **0 underruns** on channels already playing |
 | audio | DVS → P4 → PCM1690 → jack, heard on J5 |
+| sample rate | 48 / 96 kHz selected in the controller; 96 kHz: 0 I2S underruns, 0 playout steps over 5 min |
+| latency | device setting 2 ms (no "custom" warning); receive flow and measured latency reported |
 | long run | see [Measured](#measured); a soak test after the transmit fix below is in progress |
 
 Open issues are listed under [Known issues](#known-issues).
@@ -194,6 +196,16 @@ Two related settings, both kept:
   `eth_rx_kicks`, `eth_rx_restarts`, `eth_phy_resets`. It is a safety net, and
   it did **not** recover the timestamp hang; the fix above is what matters.
 
+**The same hang came back at 96 kHz**, with only PTP frames stamped. A flow
+start makes the transmitter burst at line rate and exhausts the RX
+descriptors; a PTP Sync in the FIFO at that moment is a timestamped frame, and
+the read controller hung on it exactly as before. IDF sets the DMA to *flush*
+a frame that finds no descriptor; `eth_ts.c` now sets it to **hold** the frame
+(`dis_flush_recv_frames`) until a descriptor is returned, and raises the RX
+descriptors from 20 to 64. Six flow starts in a row afterwards: no hang. If
+the signature (EMACDEBUG 0x340) ever appears again the watchdog reboots the
+board (`eth_fifo_hang_reboots`), because only a MAC software reset clears it.
+
 ## Clocking
 
 **SCKI = BCK = 256 fS = 12.288 MHz, format `FMTDA = 1000`** (24-bit high-speed
@@ -360,12 +372,54 @@ Most of the control-plane layouts come from the FPGA project (`../FPGA`),
 which was brought up against the same controller, an AM2, an A16R and DVS.
 The AM2's replies were replayed and diffed on this bench.
 
-## Why 48 kHz
+## Sample rates: 48 and 96 kHz, chosen in the controller
 
-With SCKI = BCK, the APLL has to run at 2 × 1024 × fS: 98.3 MHz at 48 kHz, but
-196.6 MHz at 96 kHz, against a 125 MHz ceiling. The verified reference
-firmware documents the same limit. `rate.c` refuses 96 kHz at boot with a
-message rather than producing a wrong clock.
+The controller's sample-rate menu works. The board advertises 48 and 96 kHz
+(info 0x80 rate table, board-info byte 0x17 = configurable). The controller's
+SET is the same info opcode as the rate query, 0x81, with content
+`u32 1, u32 rate`. The board answers the way a RedNet AM2 does (new rate
+table, then info 0x0100 and 0x0106), stores the rate in NVS and restarts onto
+it; Sync is green again ~20 s later.
+
+**96 kHz through a BCK divider of 2.** With SCKI = BCK, IDF's TDM master
+clocking needs APLL = 2 × 4 × 256 × fS: 196.6 MHz at 96 kHz, over the P4's
+125 MHz ceiling. That is why the reference firmware stopped at 48 kHz. IDF's
+"BCK divider > 2" rule exists only because data goes wrong when *receiving*
+multiple slots, and this port only transmits. So `audio_out.c` has the driver
+set up exactly the verified 48 kHz clocking (APLL 98.304 MHz, MCLK 49.152 MHz,
+BCK ÷4), then rewrites the BCK divider to 2 before the channel starts: BCK =
+SCKI = 24.576 MHz, still an even divider (50 % duty), LRCK = 96 kHz. The APLL
+runs at the same frequency at both rates, so the media-clock trim is
+unchanged. 44.1 kHz also works electrically but is not offered.
+
+## Latency
+
+Three numbers, kept apart as a real device keeps them (`media_clock.h`):
+
+| | |
+|---|---|
+| **configured** | the device setting chosen in the controller (ARC 0x1101), stored in NVS; reported in 0x1100 keys 0x8205/0x8301 |
+| **floor** | what the transmitters we receive from demand (a DVS asks for 4 ms) |
+| **effective** | max(configured, floor, minimum): what playout runs at, and what a receive flow reports |
+
+Reporting the effective value as the setting made the controller show "This
+device is using a custom latency" (4 ms is not a preset). The **minimum**
+(key 0x8306) decides which presets the controller offers: it is DMA depth +
+0.5 ms arrival margin = **1.5 ms**, so the controller offers 2 and 5 ms.
+
+The **Latency tab** needs two things. ARC 0x3200 must list the receive flows
+(port, channels per slot, rate, latency); an empty list reads "No Receive
+Connections". The heartbeat's 0x8003 block then carries each flow's measured
+latency in samples: the running maximum of (now − packet timestamp) at
+receipt, taken while PTP is locked (inferno `flows_rx.rs`; FPGA
+`docs/LATENCY.md`). From the DVS at 96 kHz: about 200 samples (~2.1 ms).
+
+**A 1 ms minimum at 96 kHz was tried and failed.** It needs 16-frame DMA
+blocks (0.5 ms of depth), which leaves the I2S task 0.33 ms of slack; `emac_rx`
+preempts it for up to ~0.2 ms through receive bursts. The bench showed
+hundreds of I2S underruns a minute, write stalls up to 100 ms, and PTP losing
+lock. Getting below 1.5 ms needs a different audio path (the DMA playing
+straight from the jitter buffer), not a smaller block.
 
 ## Measured
 
@@ -406,6 +460,15 @@ The fields that matter most:
 | `eth_rx_kicks`, `eth_rx_restarts`, `eth_phy_resets` | receive watchdog actions (should stay 0) |
 | `reset_reason` | why the board last started: 1 power-on, 3 software, 4 panic, 5–7 watchdog, 9 brown-out |
 | `peak_in_dbfs`, `peak_out_dbfs` | per-channel level from the network and to the DAC, since last read |
+| `i2s_underruns` | the DMA found no fresh block: the audio task was late (should stay 0) |
+| `audio_max_us` | worst-case µs since last read: `jb_read`, meter, `mclk_tick`, I2S write wait |
+| `rx_lat_max_samples` | highest (now − packet timestamp) at receipt since boot |
+| `mclk_latency_us`, `mclk_latency_cfg_us` | effective and configured latency |
+| `eth_fifo_hang_reboots` | reboots forced by the RX FIFO hang |
+
+UDP 7779 also answers `L` with the **request log**: recent controller requests
+that are not routine polls, as hex. That is how the rate-set command was
+captured.
 
 The telemetry **stream** (UDP 7778, sent to whoever last queried 7779) carries
 one binary record per Sync (`a` filtered offset, `b` raw offset, `c` ppb,
@@ -429,7 +492,8 @@ Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
 | file | role |
 |---|---|
 | `app_config.h` | pins and every tunable, with the reason for each |
-| `rate.[ch]` | boot-pin rate profile |
+| `rate.[ch]` | rate profiles; the controller's choice in NVS, else the boot pin |
+| `reqlog.[ch]` | ring of recent controller requests, fetched over UDP 7779 (`L`) |
 | `aoip_wire.h` | wire formats |
 | `eth_ts.[ch]` | EMAC bring-up, hardware timestamps, multicast filter |
 | `ptpv1.[ch]`, `ptp_servo.[ch]` | PTPv1 slave, staged acquisition, PI servo |
@@ -468,7 +532,7 @@ Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
    data: it does not block.
 6. **The heartbeat meters are zeros**, so the controller shows no levels. The
    board now has real per-channel peaks to report.
-7. **48 kHz only** (see above).
+7. **Minimum latency 1.5 ms**, so no 1 ms preset (see [Latency](#latency)).
 
 ## Lessons carried across
 

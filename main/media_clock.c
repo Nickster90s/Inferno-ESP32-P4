@@ -13,7 +13,21 @@ static const char *TAG = "mclk";
 
 mclk_state_t g_mclk;
 
-static uint32_t s_latency_us = AP_LATENCY_US_DEFAULT;
+static uint32_t s_latency_us = AP_LATENCY_US_DEFAULT;   // effective
+static uint32_t s_cfg_us     = AP_LATENCY_US_DEFAULT;   // controller's setting
+static uint32_t s_floor_us;                             // transmitters' demand
+
+#include "nvs.h"
+#define LAT_NVS_NS   "latency"
+#define LAT_NVS_KEY  "us"
+
+static uint32_t effective_us(void)
+{
+    uint32_t us = s_cfg_us > s_floor_us ? s_cfg_us : s_floor_us;
+    if (us < rate_get()->latency_min_us) us = rate_get()->latency_min_us;
+    if (us > AP_LATENCY_US_MAX) us = AP_LATENCY_US_MAX;
+    return us;
+}
 static uint32_t s_block_count;
 static uint32_t s_blocks_per_update;
 static uint32_t s_last_ptp_steps;
@@ -21,8 +35,12 @@ static uint32_t s_last_ptp_steps;
 esp_err_t mclk_init(uint32_t dma_depth_frames)
 {
     g_mclk.dma_depth_frames = dma_depth_frames;
-    if (s_latency_us < rate_get()->latency_min_us)
-        s_latency_us = rate_get()->latency_min_us;
+    nvs_handle_t h; uint32_t v;
+    if (nvs_open(LAT_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u32(h, LAT_NVS_KEY, &v) == ESP_OK && v) s_cfg_us = v;
+        nvs_close(h);
+    }
+    s_latency_us = effective_us();
     g_mclk.latency_frames   = (uint32_t)((uint64_t)s_latency_us * rate_hz() / 1000000);
 
     // One servo update every AP_MCLK_UPDATE_HZ; the audio task calls us once
@@ -49,16 +67,40 @@ bool mclk_now_samples(uint64_t *out)
     return true;
 }
 
-void mclk_set_latency_us(uint32_t us)
+static void apply_latency(void)
 {
-    if (us < rate_get()->latency_min_us) us = rate_get()->latency_min_us;
-    if (us > AP_LATENCY_US_MAX) us = AP_LATENCY_US_MAX;
+    uint32_t us = effective_us();
+    if (us == s_latency_us) return;          // no re-anchor, no glitch
     s_latency_us = us;
     g_mclk.latency_frames = (uint32_t)((uint64_t)us * rate_hz() / 1000000);
-    ESP_LOGI(TAG, "latency -> %u us (%u frames)", (unsigned)us,
-             (unsigned)g_mclk.latency_frames);
+    ESP_LOGI(TAG, "latency -> %u us (%u frames; configured %u, floor %u)",
+             (unsigned)us, (unsigned)g_mclk.latency_frames,
+             (unsigned)s_cfg_us, (unsigned)s_floor_us);
     mclk_anchor();
 }
+
+void mclk_set_latency_us(uint32_t us)
+{
+    if (us > AP_LATENCY_US_MAX) us = AP_LATENCY_US_MAX;
+    if (us != s_cfg_us) {
+        s_cfg_us = us;
+        nvs_handle_t h;
+        if (nvs_open(LAT_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_u32(h, LAT_NVS_KEY, us);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
+    apply_latency();
+}
+
+void mclk_set_latency_floor_us(uint32_t us)
+{
+    s_floor_us = us;
+    apply_latency();
+}
+
+uint32_t mclk_get_config_latency_us(void) { return s_cfg_us; }
 
 uint32_t mclk_get_latency_us(void) { return s_latency_us; }
 

@@ -27,6 +27,12 @@ static const rate_profile_t s_profiles[] = {
     {
         .hz = AP_RATE_96K,
         .fpp = AP_RATE_96K / AP_BLOCKS_PER_S,          // 32
+        // 32-frame DMA blocks: 3 x 32 = 1.0 ms of DMA depth, 1.5 ms minimum
+        // latency. 16-frame blocks (0.5 ms depth, which would allow a 1 ms
+        // minimum) were tried and FAILED: the I2S task's slack drops to
+        // 0.33 ms, emac_rx (priority 24) preempts it for ~0.2 ms through
+        // receive bursts, and the bench showed I2S underruns, write stalls up
+        // to 100 ms, and PTP losing lock. At 32 frames: 0 underruns.
         .dma_frames = AP_RATE_96K / AP_BLOCKS_PER_S,   // 32
         .scki_fs = 256,                                 // 24.576 MHz -- same!
         .bck_fs = AP_BCK_FS,                            // 24.576 MHz
@@ -43,6 +49,45 @@ static int s_pin_level = -1;
 const rate_profile_t *rate_get(void) { return &s_current; }
 bool rate_is_pinned(void) { return AP_RATE_PINNED; }
 int  rate_pin_level(void) { return s_pin_level; }
+
+// ---------------------------------------------------------------------------
+// Rate chosen from the controller, kept in NVS. Precedence at boot:
+//   -DSAMPLE_RATE (pinned)  >  NVS "rate" (set from the controller)  >  pin
+// ---------------------------------------------------------------------------
+#include "nvs.h"
+#define RATE_NVS_NS   "rate"
+#define RATE_NVS_KEY  "hz"
+
+static uint32_t nvs_rate(void)
+{
+    nvs_handle_t h; uint32_t v = 0;
+    if (nvs_open(RATE_NVS_NS, NVS_READONLY, &h) != ESP_OK) return 0;
+    if (nvs_get_u32(h, RATE_NVS_KEY, &v) != ESP_OK) v = 0;
+    nvs_close(h);
+    return v;
+}
+
+bool rate_supported(uint32_t hz)
+{
+    for (size_t i = 0; i < sizeof(s_profiles) / sizeof(s_profiles[0]); i++)
+        if (s_profiles[i].hz == hz) return true;
+    return false;
+}
+
+esp_err_t rate_request(uint32_t hz)
+{
+    if (AP_RATE_PINNED) return ESP_ERR_NOT_SUPPORTED;
+    if (!rate_supported(hz)) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(RATE_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u32(h, RATE_NVS_KEY, hz);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+static const char *s_source = "default";
 
 esp_err_t rate_select(void)
 {
@@ -69,9 +114,16 @@ esp_err_t rate_select(void)
         s_pin_level = gpio_get_level(AP_PIN_RATE_SEL);
         if (!AP_RATE_PINNED) {
             want = s_pin_level ? AP_RATE_48K : AP_RATE_96K;
+            s_source = "selection pin";
         }
     }
 #endif
+    if (AP_RATE_PINNED) {
+        s_source = "build-time -DSAMPLE_RATE";
+    } else {
+        uint32_t v = nvs_rate();
+        if (v && rate_supported(v)) { want = v; s_source = "controller (NVS)"; }
+    }
 
     for (size_t i = 0; i < sizeof(s_profiles) / sizeof(s_profiles[0]); i++) {
         if (s_profiles[i].hz == want) {
@@ -82,8 +134,7 @@ esp_err_t rate_select(void)
             s_current.latency_min_us = s_current.dma_depth_us + LATENCY_MARGIN_US;
 
             ESP_LOGW(TAG, "===== %s =====", s_current.label);
-            ESP_LOGI(TAG, "  source      %s%s",
-                     AP_RATE_PINNED ? "build-time -DSAMPLE_RATE" : "selection pin",
+            ESP_LOGI(TAG, "  source      %s%s", s_source,
                      (AP_RATE_PINNED && s_pin_level >= 0) ? " (PIN IGNORED)" : "");
 #if AP_PIN_RATE_SEL >= 0
             ESP_LOGI(TAG, "  pin %-3d     %s -> %s", AP_PIN_RATE_SEL,
@@ -103,15 +154,10 @@ esp_err_t rate_select(void)
             ESP_LOGI(TAG, "  latency     %u..%u us",
                      (unsigned)s_current.latency_min_us, AP_LATENCY_US_MAX);
 
-            // SCKI IS BCK (audio_out.c route_bck_to_scki), and the APLL must
-            // reach 2 x mclk_multiple x fs within its 125 MHz ceiling. That
-            // caps this design at 48 kHz: 96 kHz needs 196 MHz (the verified
-            // ../stm32 UAC firmware documents the same ceiling).
-            if (s_current.scki_fs != s_current.bck_fs ||
-                2ULL * AP_I2S_MCLK_MULTIPLE * s_current.hz > 125000000ULL) {
-                ESP_LOGE(TAG, "%s is not possible with SCKI = BCK from the APLL "
-                              "(needs %.1f MHz, ceiling 125 MHz)", s_current.label,
-                         2.0 * AP_I2S_MCLK_MULTIPLE * s_current.hz / 1e6);
+            // SCKI IS BCK (audio_out.c route_bck_to_scki). 96 kHz is reached
+            // with a BCK divider of 2 off the 48 kHz APLL -- see audio_out.c.
+            if (s_current.scki_fs != s_current.bck_fs) {
+                ESP_LOGE(TAG, "%s: SCKI must equal BCK", s_current.label);
                 return ESP_ERR_INVALID_STATE;
             }
             return ESP_OK;

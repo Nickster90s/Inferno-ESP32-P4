@@ -57,11 +57,11 @@ static void wait_for_ip(void)
 void app_main(void)
 {
     // FIRST, before any clock or peripheral is configured: which rate are
-    // we? Everything downstream derives from it, and the answer comes off
-    // a pin that must be read while it is still just a pin.
-    ESP_ERROR_CHECK(rate_select());
-
+    // we? Everything downstream derives from it. NVS comes first only
+    // because a rate chosen in the controller is stored there; the rate pin
+    // is still read while it is just a pin.
     ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(rate_select());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 

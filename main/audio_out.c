@@ -1,3 +1,4 @@
+#include "esp_timer.h"
 #include "audio_out.h"
 #include "app_config.h"
 #include "rate.h"
@@ -22,6 +23,24 @@ static int32_t s_block[AP_DMA_FRAMES_MAX * AP_NCH];
 
 uint32_t audio_out_dma_depth_frames(void) { return rate_get()->dma_depth_frames; }
 uint32_t audio_out_blocks(void) { return s_blocks; }
+
+// I2S UNDERRUNS: the DMA wanted a block the audio task had not written yet
+// (auto_clear then sends silence). The direct measure of the audio task
+// missing its deadline -- which a playout step only shows indirectly.
+static volatile uint32_t s_i2s_underruns;
+// Audio loop profile, worst-case us: jb_read, meters, mclk_tick, write wait.
+static volatile uint32_t s_prof[4];
+void audio_out_take_profile(uint32_t out[4])
+{
+    for (int i = 0; i < 4; i++) { out[i] = s_prof[i]; s_prof[i] = 0; }
+}
+uint32_t audio_out_i2s_underruns(void) { return s_i2s_underruns; }
+static bool IRAM_ATTR on_send_q_ovf(i2s_chan_handle_t h, i2s_event_data_t *e, void *u)
+{
+    (void)h; (void)e; (void)u;
+    s_i2s_underruns++;
+    return false;
+}
 
 static volatile uint32_t s_peak_out[AP_NCH];    // max |sample| sent to the DAC, 32-bit
 
@@ -50,7 +69,33 @@ void audio_out_take_peaks(uint32_t *out)
 // off the audio port's APLL. On the bench it read 33 % duty (odd divider),
 // and the DAC stayed silent with audio arriving at -5 dBFS on DIN1.
 #include "soc/i2s_periph.h"
+#include "soc/i2s_struct.h"
+#include "hal/i2s_ll.h"
+#include "hal/clk_tree_ll.h"
 #include "esp_rom_gpio.h"
+
+// ---------------------------------------------------------------------------
+// 96 kHz: BCK DIVIDER 2, set behind the driver's back
+// ---------------------------------------------------------------------------
+//
+// IDF's TDM master clocking is APLL -> MCLK (divider >= 2) -> BCK (divider
+// >= 3, rounded to an even 4 here for SCKI's duty cycle). At 96 kHz, BCK =
+// 256 fs = 24.576 MHz, and that chain needs a 196.6 MHz APLL -- over the
+// P4's 125 MHz ceiling, which is why ../stm32/ESP32-P4/p4-uac-pcm1690 stopped
+// at 48 kHz.
+//
+// The BCK >= 3 rule is the driver's, not the hardware's: i2s_tdm.c says data
+// goes wrong at <= 2 "while RECEIVING multiple slots". This port only
+// transmits. So the driver is configured for HALF the rate -- exactly the
+// verified 48 kHz clocking, APLL 98.304 MHz, MCLK 49.152 MHz, BCK divider 4 --
+// and the BCK divider is then rewritten to 2 before the channel is enabled
+// (i2s_ll_tx_start latches it). BCK = 24.576 MHz, still an even divider, so
+// still 50 % duty for SCKI; LRCK = 96 kHz. The APLL is at the same frequency
+// as at 48 kHz, so the media-clock trim range is unchanged too.
+static bool bck_halved(uint32_t hz)
+{
+    return 2ULL * AP_I2S_MCLK_MULTIPLE * hz > CLK_LL_APLL_MAX_HZ;
+}
 
 static void route_bck_to_scki(void)
 {
@@ -76,7 +121,7 @@ esp_err_t audio_out_init(void)
 
     i2s_tdm_config_t tdm_cfg = {
         .clk_cfg = {
-            .sample_rate_hz = r->hz,
+            .sample_rate_hz = bck_halved(r->hz) ? r->hz / 2 : r->hz,
             // APLL, not the default clock. This is the whole media clock: with
             // I2S_CLK_SRC_DEFAULT the sample rate is whatever the SoC's PLL
             // divides to and there is nothing to trim.
@@ -141,6 +186,21 @@ esp_err_t audio_out_init(void)
         return err;
     }
 
+    if (bck_halved(r->hz)) {
+        uint32_t was = I2S0.tx_conf.tx_bck_div_num + 1;
+        if (was != 4) {
+            ESP_LOGE(TAG, "%s: expected the driver's BCK divider 4, found %u",
+                     r->label, (unsigned)was);
+            return ESP_ERR_INVALID_STATE;
+        }
+        i2s_ll_tx_set_bck_div_num(&I2S0, 2);
+        ESP_LOGW(TAG, "%s: BCK divider 4 -> 2 (APLL as at %u Hz)",
+                 r->label, (unsigned)(r->hz / 2));
+    }
+
+    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = on_send_q_ovf };
+    i2s_channel_register_event_callback(s_tx, &cbs, NULL);
+
     // Audio port first (it sets the APLL), then the SCKI generator.
     route_bck_to_scki();
 
@@ -169,10 +229,14 @@ static void audio_task(void *arg)
     }
 
     for (;;) {
+        int64_t t0 = esp_timer_get_time();
         jb_read(s_block, frames);
+        int64_t t1 = esp_timer_get_time();
 
-        // Output meter: what goes to the DAC. Signal here and silence from the
+        // Output meter: what goes to the DAC, on every 8th block -- a level
+        // display needs no more, and it was ~48 us per block. Signal here and silence from the
         // speaker means the DAC side (control port, wiring, power, AMUTEI).
+        if ((s_blocks & 7) == 0)
         for (uint32_t f = 0; f < frames; f++) {
             for (int c = 0; c < AP_NCH; c++) {
                 int32_t v = s_block[f * AP_NCH + c];
@@ -185,10 +249,19 @@ static void audio_task(void *arg)
         // has room, so this loop runs at exactly the media clock rate and
         // nothing else in the system decides when audio moves. Do not replace
         // it with a timer, and do not add a queue in front of it.
+        int64_t t2 = esp_timer_get_time();
         i2s_channel_write(s_tx, s_block, bytes, &written, portMAX_DELAY);
+        int64_t t3 = esp_timer_get_time();
         s_blocks++;
 
         mclk_tick();
+        int64_t t4 = esp_timer_get_time();
+        // Worst case of each stage since the last telemetry read: the audio
+        // task has (desc_num - 1) blocks of slack -- 0.33 ms at 96 kHz / 16.
+        if (t1 - t0 > s_prof[0]) s_prof[0] = (uint32_t)(t1 - t0);
+        if (t2 - t1 > s_prof[1]) s_prof[1] = (uint32_t)(t2 - t1);
+        if (t4 - t3 > s_prof[2]) s_prof[2] = (uint32_t)(t4 - t3);
+        if (t3 - t2 > s_prof[3]) s_prof[3] = (uint32_t)(t3 - t2);
     }
 }
 

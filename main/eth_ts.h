@@ -49,6 +49,7 @@ esp_err_t eth_ts_start(void);
 // Receive watchdog counters (see eth_ts.c).
 uint32_t eth_ts_rx_kicks(void);
 uint32_t eth_ts_rx_restarts(void);
+uint32_t eth_ts_fifo_hang_reboots(void);   // RX FIFO hang -> reboot, across reboots
 uint32_t eth_ts_phy_resets(void);
 // RX DMA state now, and cumulative missed / FIFO-overflow frame counts.
 void eth_ts_mac_dump(void);

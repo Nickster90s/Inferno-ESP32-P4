@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "freertos/task.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_mac.h"
 #include "soc/soc_caps.h"
 #if SOC_EMAC_IEEE1588V2_SUPPORTED
@@ -125,6 +126,23 @@ static void eth_event_handler(void *arg, esp_event_base_t base, int32_t id, void
 // Init
 // ---------------------------------------------------------------------------
 
+// HOLD, don't FLUSH, a frame that finds no free RX descriptor.
+//
+// IDF enables flushing (emac_hal_init_dma_default). A flow start makes the
+// transmitter burst at line rate; 64 descriptors fill in ~1.6 ms whatever the
+// CPU does, and a PTP Sync in the FIFO at that moment -- a TIMESTAMPED frame
+// -- hung the MTL RX read controller in "reading frame status / timestamp"
+// with the FIFO full (EMACDEBUG 0x340): receive dead until a reboot. Seen at
+// every flow start once 96 kHz ran 6000 DMA blocks/s. With flushing disabled
+// the frame waits in the FIFO for a descriptor (the driver issues a receive
+// poll demand as it returns them) and newer frames overflow at the FIFO
+// instead -- a counted, recoverable drop.
+#include "soc/emac_dma_struct.h"
+static void rx_hold_not_flush(void)
+{
+    EMAC_DMA.dmaoperation_mode.dis_flush_recv_frames = 1;
+}
+
 esp_err_t eth_ts_init(void)
 {
     eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
@@ -225,6 +243,7 @@ esp_err_t eth_ts_init(void)
     // and the flow liveness check handle.
     bool fc = false;
     esp_eth_ioctl(s_eth, ETH_CMD_S_FLOW_CTRL, &fc);
+    rx_hold_not_flush();
 
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     s_netif = esp_netif_new(&netif_cfg);
@@ -297,9 +316,17 @@ static void eee_disable(void)
 #include "soc/emac_dma_struct.h"
 #include "soc/emac_mac_struct.h"
 
+#include "esp_attr.h"
+#include "esp_system.h"
+// Survives the reboot it counts (not zeroed at a software reset).
+static RTC_NOINIT_ATTR uint32_t s_fifo_hang_reboots;
+static RTC_NOINIT_ATTR uint32_t s_fifo_hang_magic;
+uint32_t eth_ts_fifo_hang_reboots(void) { return s_fifo_hang_reboots; }
+
 static void rx_watchdog_task(void *arg)
 {
     (void)arg;
+    if (s_fifo_hang_magic != 0x46494630u) { s_fifo_hang_magic = 0x46494630u; s_fifo_hang_reboots = 0; }
     uint32_t last = s_rx_frames;
     int idle_ms = 0;
     TaskHandle_t emac_rx = NULL;
@@ -324,11 +351,25 @@ static void rx_watchdog_task(void *arg)
             s_rx_kicks++;
             ESP_LOGW(TAG, "no RX for %d ms -- kicked emac_rx (#%u)", idle_ms,
                      (unsigned)s_rx_kicks);
+        } else if (idle_ms == 3000 && EMAC_MAC.emacdebug.mtlrfrcs == 2 &&
+                   EMAC_MAC.emacdebug.mtlrffls == 3) {
+            // THE RX FIFO HANG: read controller stuck on a frame's status /
+            // timestamp, FIFO full (EMACDEBUG 0x340). Neither esp_eth_stop/
+            // start nor a PHY reset clears it -- measured, 19 restarts in a
+            // row -- only a MAC software reset does, and that is a reboot's
+            // worth of state (PTP clock, filters, flows). So reboot: audio
+            // is back in ~25 s instead of never.
+            s_fifo_hang_reboots++;
+            ESP_LOGE(TAG, "RX FIFO hang (EMACDEBUG %08x) -- rebooting (#%u)",
+                     (unsigned)EMAC_MAC.emacdebug.val, (unsigned)s_fifo_hang_reboots);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
         } else if (idle_ms == 4000) {
             s_rx_restarts++;
             ESP_LOGE(TAG, "RX still dead -- restarting EMAC (#%u)", (unsigned)s_rx_restarts);
             esp_eth_stop(s_eth);
             esp_eth_start(s_eth);
+            rx_hold_not_flush();
         } else if (idle_ms >= 8000) {
             // Even an EMAC restart did not help: the silence is below the MAC.
             // Soft-reset the PHY (BMCR bit 15), put EEE back off, renegotiate.
@@ -375,6 +416,7 @@ esp_err_t eth_ts_start(void)
 {
     eee_disable();                   // before autonegotiation starts
     esp_err_t err = esp_eth_start(s_eth);
+    rx_hold_not_flush();
     xTaskCreatePinnedToCore(rx_watchdog_task, "rx_wdog", 3072, NULL, 10, NULL, 1);
     return err;
 }

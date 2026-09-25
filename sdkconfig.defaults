@@ -22,7 +22,12 @@ CONFIG_ETH_PHY_INTERFACE_RMII=y
 # On the P4 the RMII clock is NOT a Kconfig option (CONFIG_ETH_RMII_CLK_* is
 # ESP32-only in IDF 5.5); it is set in eth_ts.c from AP_PIN_ETH_REF_CLK.
 CONFIG_ETH_DMA_BUFFER_SIZE=1600
-CONFIG_ETH_DMA_RX_BUFFER_NUM=20
+# 64, not 20: 20 x 1600 B covers ~6.7 ms at 3000 audio packets/s, and any
+# longer stall of emac_rx (a flash write) exhausted them. A PTP Sync arriving
+# then hangs the MTL RX FIFO read controller in "reading frame status /
+# timestamp" with the FIFO full (EMACDEBUG 0x340) -- receive dead, and no EMAC
+# or PHY restart clears it (eth_ts.c reboots on that signature). 64 = ~21 ms.
+CONFIG_ETH_DMA_RX_BUFFER_NUM=64
 CONFIG_ETH_DMA_TX_BUFFER_NUM=10
 # TRANSMIT MUTEX -- REQUIRED. The PTP task (core 0) sends Delay_Req through
 # esp_eth_transmit_ctrl_vargs() to get a hardware TX timestamp, while lwIP
@@ -59,3 +64,8 @@ CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
 # --- Logging ---------------------------------------------------------------
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
+# -O2, not IDF's default -Og. At -Og the audio loop's per-block work took
+# ~93 us of a 167 us period at 96 kHz / 16-frame blocks (a 128-sample peak
+# meter alone cost 48 us), and packet receive saturated core 1.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

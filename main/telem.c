@@ -1,4 +1,5 @@
 #include "telem.h"
+#include "reqlog.h"
 #include "eth_ts.h"
 #include "esp_system.h"
 #include <math.h>
@@ -79,7 +80,7 @@ static int build_stats(char *out, size_t cap)
         "uptime_ms=%u\n"
         "reset_reason=%d\n"
         "eth_rx_kicks=%u\n"
-        "eth_rx_restarts=%u\n"
+        "eth_rx_restarts=%u\neth_fifo_hang_reboots=%u\ni2s_underruns=%u\n"
         "eth_phy_resets=%u\n"
         "rate_hz=%u\n"
         "rate_pin=%d\n"
@@ -112,7 +113,7 @@ static int build_stats(char *out, size_t cap)
         "mclk_lsb_ppb=%u\n"
         "mclk_anchors=%u\n"
         "mclk_reset_steps=%u\n"
-        "mclk_latency_us=%u\n"
+        "mclk_latency_us=%u\nmclk_latency_cfg_us=%u\n"
         "jb_level_frames=%d\n"
         "jb_underrun_frames=%u\n"
         "jb_pkt_written=%u\n"
@@ -125,7 +126,7 @@ static int build_stats(char *out, size_t cap)
         "rx_wrong_len=%u\n"
         "rx_ka_sent=%u\n"
         "rx_ka_failed=%u\n"
-        "rx_ka_errno=%d\n"
+        "rx_ka_errno=%d\nrx_lat_max_samples=%d\n"
         "fc_last_op=%u\n"
         "fc_last_code=%u\n"
         "fc_refused=%u\n"
@@ -143,7 +144,7 @@ static int build_stats(char *out, size_t cap)
         // 6 task WDT, 7 other WDT, 9 brown-out. Anything but 1/3 after a
         // silent reboot is a crash, and says which kind.
         (int)esp_reset_reason(),
-        (unsigned)eth_ts_rx_kicks(), (unsigned)eth_ts_rx_restarts(), (unsigned)eth_ts_phy_resets(),
+        (unsigned)eth_ts_rx_kicks(), (unsigned)eth_ts_rx_restarts(), (unsigned)eth_ts_fifo_hang_reboots(), (unsigned)audio_out_i2s_underruns(), (unsigned)eth_ts_phy_resets(),
         (unsigned)rate_hz(), rate_pin_level(), (int)rate_is_pinned(),
         (unsigned)rate_get()->fpp,
         g_ptpv1.locked, g_ptpv1.have_master,
@@ -160,13 +161,13 @@ static int build_stats(char *out, size_t cap)
         g_mclk.armed, g_mclk.anchored, (int)g_mclk.error_frames,
         (int)g_mclk.ppb_target, (int)g_mclk.ppb_applied, (int)g_mclk.ppb_ff,
         (unsigned)mclk_hw_lsb_ppb(), (unsigned)g_mclk.anchors,
-        (unsigned)g_mclk.reset_steps, (unsigned)mclk_get_latency_us(),
+        (unsigned)g_mclk.reset_steps, (unsigned)mclk_get_latency_us(), (unsigned)mclk_get_config_latency_us(),
         (int)jb.level_frames, (unsigned)jb.frames_underrun,
         (unsigned)jb.pkt_written, (unsigned)jb.pkt_late, (unsigned)jb.pkt_future,
         (unsigned)jb.playout_steps,
         (unsigned)rx.packets, (unsigned)rx.bad_magic, (unsigned)rx.short_pkt,
         (unsigned)rx.wrong_len,
-        (unsigned)rx.ka_sent, (unsigned)rx.ka_failed, (int)rx.ka_last_errno,
+        (unsigned)rx.ka_sent, (unsigned)rx.ka_failed, (int)rx.ka_last_errno, (int)rx.lat_max_samples,
         (unsigned)g_flows_diag.last_opcode, (unsigned)g_flows_diag.last_code,
         (unsigned)g_flows_diag.refused, (unsigned)g_flows_diag.timeouts,
         (unsigned)sub.flows_active, (unsigned)sub.requests_ok,
@@ -189,6 +190,11 @@ static int build_stats(char *out, size_t cap)
             n += snprintf(out + n, cap - n, "%d%s", db, c + 1 < AP_NCH ? "," : "\n");
         }
     }
+    uint32_t prof[4];
+    audio_out_take_profile(prof);
+    if ((size_t)n < cap)
+        n += snprintf(out + n, cap - n, "audio_max_us=%u,%u,%u,%u\n",
+                      (unsigned)prof[0], (unsigned)prof[1], (unsigned)prof[2], (unsigned)prof[3]);
     return n;
 }
 
@@ -241,7 +247,11 @@ static void telem_task(void *arg)
         char q[8];
         int qn = recvfrom(stats, q, sizeof(q), MSG_DONTWAIT,
                           (struct sockaddr *)&from, &flen);
-        if (qn > 0) {
+        if (qn > 0 && q[0] == 'L') {
+            // Request log (reqlog.c): what controllers have been asking.
+            int len = reqlog_dump(txt, sizeof(txt));
+            sendto(stats, txt, (size_t)(len > 0 ? len : 1), 0, (struct sockaddr *)&from, flen);
+        } else if (qn > 0) {
             int len = build_stats(txt, sizeof(txt));
             if (len > 0) {
                 sendto(stats, txt, (size_t)len, 0, (struct sockaddr *)&from, flen);

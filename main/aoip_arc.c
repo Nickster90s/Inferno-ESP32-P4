@@ -9,11 +9,13 @@
 
 #include "aoip_arc.h"
 #include "aoip_msg.h"
+#include "reqlog.h"
 #include "aoip_wire.h"
 #include "aoip_mdns.h"
 #include "subscriber.h"
 #include "media_clock.h"
 #include "rate.h"
+#include "eth_ts.h"
 #include "app_config.h"
 #include "lwip/sockets.h"
 #include "esp_netif.h"
@@ -241,11 +243,70 @@ static uint32_t handle(const uint8_t *req, uint32_t len, uint8_t *buf, uint16_t 
     case ARC_OP_GET_TX_CHANNELS:        // 0x2000
     case 0x2010:                        // tx friendly names
     case 0x2200:                        // tx flows
-    case 0x2204:                        // tx flow detail -- MUST be OK+empty, an
+    case 0x2204: {                      // tx flow detail -- MUST be OK+empty, an
                                         // error made DC loop at ~1 kHz (FPGA)
-    case 0x3200: {                      // rx flows. TODO: describe active flows
         page_t pg;
         page_begin(&m, &pg, 8, 0);
+        page_end(&m, &pg);
+        break;
+    }
+
+    case 0x3200: {
+        // RX FLOWS -- the controller's Latency tab lists these as "Receive
+        // Connections"; an empty list reads "No Receive Connections". Layout
+        // from inferno arc_server.rs (query_rx_flows). Items are u16 offsets
+        // to a flow descriptor:
+        //   u16 flow id, u16 1, u32 rate, u16 0, u16 bits, u16 1,
+        //   u16 slots, u16 words per bitmask, u16 -> socket,
+        //   slots x u16 -> bitmask (local channels fed by that slot),
+        //   u16 -> latency descriptor
+        // socket  = u16 0x8002, u16 port, u8[4] our address
+        // latency = u16 9, u16 1, u16 0x800, u16 0, u32 latency ns, u32 0
+        subscriber_flow_t fl[AP_MAX_FLOWS];
+        int nf = subscriber_get_flows(fl, AP_MAX_FLOWS);
+        uint8_t ip[4] = {0};
+        esp_netif_ip_info_t ii;
+        if (esp_netif_get_ip_info(eth_ts_netif(), &ii) == ESP_OK) memcpy(ip, &ii.ip.addr, 4);
+
+        page_t pg;
+        page_begin(&m, &pg, 2, AP_MAX_FLOWS);
+        for (int i = 0; i < nf; i++) {
+            while (m.len & 3) aoip_msg_u8(&m, 0);
+            uint16_t sock = (uint16_t)m.len;
+            aoip_msg_u16(&m, 0x8002);
+            aoip_msg_u16(&m, fl[i].rx_port);
+            aoip_msg_bytes(&m, ip, 4);
+
+            uint16_t lat = (uint16_t)m.len;
+            aoip_msg_u16(&m, 9); aoip_msg_u16(&m, 1);
+            aoip_msg_u16(&m, 0x800); aoip_msg_u16(&m, 0);
+            aoip_msg_u32(&m, mclk_get_latency_us() * 1000u);
+            aoip_msg_u32(&m, 0);
+
+            uint16_t masks[AP_MAX_CH_PER_FLOW];
+            for (int k = 0; k < fl[i].nslots; k++) {
+                masks[k] = (uint16_t)m.len;
+                int8_t c = fl[i].slot_to_ch[k];
+                aoip_msg_u16(&m, c >= 0 ? (uint16_t)(1u << c) : 0);
+            }
+
+            while (m.len & 3) aoip_msg_u8(&m, 0);
+            uint16_t desc = (uint16_t)m.len;
+            aoip_msg_u16(&m, (uint16_t)(fl[i].slot + 1));  // = heartbeat 0x8003 index + 1
+            aoip_msg_u16(&m, 1);
+            aoip_msg_u32(&m, rate_hz());
+            aoip_msg_u16(&m, 0);
+            aoip_msg_u16(&m, AP_BITS_PER_SAMPLE);
+            aoip_msg_u16(&m, 1);
+            aoip_msg_u16(&m, fl[i].nslots);
+            aoip_msg_u16(&m, 1);                     // 8 channels: one word
+            aoip_msg_u16(&m, sock);
+            for (int k = 0; k < fl[i].nslots; k++) aoip_msg_u16(&m, masks[k]);
+            aoip_msg_u16(&m, lat);
+
+            dw_wr16(page_slot(&m, &pg), desc);
+            pg.actual++;
+        }
         page_end(&m, &pg);
         break;
     }
@@ -345,11 +406,17 @@ static uint32_t handle(const uint8_t *req, uint32_t len, uint8_t *buf, uint16_t 
         // Current latency tracks the setting; the MINIMUM is ours, not the
         // AM2's 1 ms -- this receiver's floor is DMA depth + margin, so DC must
         // not offer below it.
-        uint32_t cur_ns = mclk_get_latency_us() * 1000u;
+        // The DEVICE SETTING, not the effective value: a DVS raises the
+        // effective latency to its own 4 ms, which the controller would show
+        // as "custom latency" (media_clock.h).
+        uint32_t cur_ns = mclk_get_config_latency_us() * 1000u;
         uint32_t min_ns = rate_get()->latency_min_us * 1000u;
         arc_1100_patch_u32(0x8205, cur_ns);
         arc_1100_patch_u32(0x8301, cur_ns);
         arc_1100_patch_u32(0x8306, min_ns);
+        // 0x8020 = CURRENT SAMPLE RATE (read off a RedNet AM2 while its rate
+        // was switched 48 -> 96 -> 44.1 kHz in the controller).
+        arc_1100_patch_u32(0x8020, rate_hz());
         aoip_msg_bytes(&m, arc_1100_body, sizeof(arc_1100_body));
         break;
     }
@@ -369,7 +436,7 @@ static uint32_t handle(const uint8_t *req, uint32_t len, uint8_t *buf, uint16_t 
             break;
         }
         mclk_set_latency_us(v1 / 1000u);
-        ESP_LOGI(TAG, "latency set to %u us (now %u us)", (unsigned)(v1 / 1000u),
+        ESP_LOGI(TAG, "latency set to %u us (effective %u us)", (unsigned)(v1 / 1000u),
                  (unsigned)mclk_get_latency_us());
         aoip_msg_bytes(&m, content, clen);       // echo, as the FPGA does
         break;
@@ -420,6 +487,17 @@ static void arc_task(void *arg)
         int n = recvfrom(s, rx, sizeof(rx), 0, (struct sockaddr *)&from, &flen);
         if (n < (int)AOIP_HDR_LEN) continue;
         if (aoip_req_opcode2(rx) != 0) continue;      // not a request
+
+        // Keep a copy of everything that is not routine polling: the set
+        // commands (sample rate, latency, ...) are what we want to learn.
+        switch (aoip_req_opcode1(rx)) {
+        case 0x1000: case 0x1002: case 0x1003: case 0x1102: case 0x2000:
+        case 0x2010: case 0x2032: case 0x2200: case 0x2204: case 0x2320:
+        case 0x3000: case 0x3200: case 0x3300: case 0x4100:
+            break;
+        default:
+            reqlog_add("arc", from.sin_addr.s_addr, rx, n);
+        }
 
         uint16_t code;
         uint32_t rlen = handle(rx, (uint32_t)n, tx, &code);

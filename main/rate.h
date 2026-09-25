@@ -33,7 +33,14 @@ typedef struct {
 
 // Read the selection pin and latch the profile. Call this FIRST in app_main,
 // before any audio or network hardware is configured.
+// Call after nvs_flash_init(): a rate set from the controller lives in NVS.
 esp_err_t rate_select(void);
+
+// Rates this build can run: 48 and 96 kHz (SCKI = BCK; 96k via BCK divider 2, audio_out.c).
+bool rate_supported(uint32_t hz);
+
+// Store `hz` as the rate to boot at; takes effect after a restart.
+esp_err_t rate_request(uint32_t hz);
 
 const rate_profile_t *rate_get(void);
 

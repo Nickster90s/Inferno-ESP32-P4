@@ -56,7 +56,7 @@ static int64_t median_push(ptp_servo_t *s, int64_t v)
     s->median_pos = (uint8_t)((s->median_pos + 1) % s->median_n);
     if (s->median_count < s->median_n) s->median_count++;
 
-    int64_t tmp[PS_MEDIAN_MAX];
+    int64_t tmp[PS_MEDIAN_MAX] = {0};    // = {0}: -O2 cannot see count >= 1
     for (uint8_t i = 0; i < s->median_count; i++) tmp[i] = s->median_buf[i];
     for (uint8_t i = 1; i < s->median_count; i++) {
         int64_t k = tmp[i];

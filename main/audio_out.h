@@ -18,6 +18,9 @@ esp_err_t audio_out_start(void);
 // Frames of DMA ahead of the converter. A constant, folded into the media
 // clock's phase target.
 uint32_t audio_out_dma_depth_frames(void);
+uint32_t audio_out_i2s_underruns(void);
+// Worst-case us since the last call: jb_read, meters, mclk_tick, write wait.
+void audio_out_take_profile(uint32_t out[4]);    // DMA found no fresh block (task late)
 
 uint32_t audio_out_blocks(void);
 

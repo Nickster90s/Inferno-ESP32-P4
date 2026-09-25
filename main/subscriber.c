@@ -129,6 +129,23 @@ esp_err_t subscriber_rename(uint8_t c, const char *friendly)
     return ESP_OK;
 }
 
+int subscriber_get_flows(subscriber_flow_t *out, int max)
+{
+    // Read without the lock: s_flow belongs to the subscriber task, and a
+    // flow list a poll out of date is harmless to the controller.
+    int n = 0;
+    for (int i = 0; i < AP_MAX_FLOWS && n < max; i++) {
+        const flow_slot_t *f = &s_flow[i];
+        if (f->state != F_ACTIVE) continue;
+        out[n].slot    = (uint8_t)i;
+        out[n].rx_port = f->req.rx_port;
+        out[n].nslots  = f->req.nslots;
+        memcpy(out[n].slot_to_ch, f->slot_to_ch, sizeof(out[n].slot_to_ch));
+        n++;
+    }
+    return n;
+}
+
 void subscriber_get_stats(subscriber_stats_t *out)
 {
     uint8_t n = 0;
@@ -185,8 +202,8 @@ static bool resolve_cached(uint8_t c, const rx_channel_t *ch, tx_channel_t *out)
     }
     r->valid = false;
     if (chan_resolve(ch->tx_channel, ch->tx_device, out) != ESP_OK) return false;
-    strncpy(r->tx_channel, ch->tx_channel, sizeof(r->tx_channel) - 1);
-    strncpy(r->tx_device, ch->tx_device, sizeof(r->tx_device) - 1);
+    strlcpy(r->tx_channel, ch->tx_channel, sizeof(r->tx_channel));
+    strlcpy(r->tx_device, ch->tx_device, sizeof(r->tx_device));
     r->tx = *out;
     r->valid = true;
     return true;
@@ -269,6 +286,7 @@ static void rebuild(void)
     want_t want[AP_MAX_FLOWS];
     memset(want, 0, sizeof(want));
     int nwant = 0;
+    uint32_t floor_us = 0;
 
     for (uint8_t c = 0; c < AP_NCH; c++) {
         if (!snap[c].tx_channel[0]) { s_res[c].valid = false; continue; }
@@ -318,14 +336,12 @@ static void rebuild(void)
         want[w].req.tx_channel_id[k] = tx.tx_channel_id;
         want[w].slot_to_ch[k]        = (int8_t)c;
 
-        // The transmitter's advertised latency is a floor on ours.
+        // The transmitter's advertised latency is a floor on ours -- but
+        // not the device setting (media_clock.h), which the controller shows.
         uint32_t tx_lat_us = tx.latency_ns / 1000;
-        if (tx_lat_us > mclk_get_latency_us()) {
-            ESP_LOGI(TAG, "raising latency to %u us: %s asks for it",
-                     (unsigned)tx_lat_us, snap[c].tx_device);
-            mclk_set_latency_us(tx_lat_us);
-        }
+        if (tx_lat_us > floor_us) floor_us = tx_lat_us;
     }
+    mclk_set_latency_floor_us(floor_us);
 
     // 2. Reconcile the flows we HAVE against it.
     for (int i = 0; i < AP_MAX_FLOWS; i++) {
@@ -363,7 +379,7 @@ static void rebuild(void)
 
         flow_slot_t *f = &s_flow[i];
         memset(f, 0, sizeof(*f));
-        strncpy(f->device, w->device, sizeof(f->device) - 1);
+        strlcpy(f->device, w->device, sizeof(f->device));
         f->req = w->req;
         memcpy(f->slot_to_ch, w->slot_to_ch, sizeof(f->slot_to_ch));
 
