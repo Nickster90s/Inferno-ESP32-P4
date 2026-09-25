@@ -16,29 +16,21 @@
 static const char *TAG = "audio_out";
 
 static i2s_chan_handle_t s_tx;     // audio: BCK / WS / DOUT
-static uint32_t s_blocks;
+static volatile uint32_t s_blocks;  // TX interrupts (descriptors played)
 
-// Staging buffer, sized for the fastest rate and under-filled at the slower.
-static int32_t s_block[AP_DMA_FRAMES_MAX * AP_NCH];
-
-uint32_t audio_out_dma_depth_frames(void) { return rate_get()->dma_depth_frames; }
+// The DMA plays the ring itself (jitterbuf.h): DAC position is jb_playout_idx()
+// directly, so there is no depth to fold into the media clock's target. The
+// DMA's lead (read-ahead + FIFO) sits in the latency minimum instead (rate.c).
+uint32_t audio_out_dma_depth_frames(void) { return 0; }
 uint32_t audio_out_blocks(void) { return s_blocks; }
 
-// I2S UNDERRUNS: the DMA wanted a block the audio task had not written yet
-// (auto_clear then sends silence). The direct measure of the audio task
-// missing its deadline -- which a playout step only shows indirectly.
-static volatile uint32_t s_i2s_underruns;
-// Audio loop profile, worst-case us: jb_read, meters, mclk_tick, write wait.
-static volatile uint32_t s_prof[4];
-void audio_out_take_profile(uint32_t out[4])
+// Every finished descriptor: the ring's position. The driver then zeroes the
+// buffer (auto_clear), so it plays silence next lap unless a packet lands.
+static bool IRAM_ATTR on_sent(i2s_chan_handle_t h, i2s_event_data_t *e, void *u)
 {
-    for (int i = 0; i < 4; i++) { out[i] = s_prof[i]; s_prof[i] = 0; }
-}
-uint32_t audio_out_i2s_underruns(void) { return s_i2s_underruns; }
-static bool IRAM_ATTR on_send_q_ovf(i2s_chan_handle_t h, i2s_event_data_t *e, void *u)
-{
-    (void)h; (void)e; (void)u;
-    s_i2s_underruns++;
+    (void)h; (void)u;
+    jb_isr_sent(e->dma_buf);
+    s_blocks++;
     return false;
 }
 
@@ -114,9 +106,12 @@ esp_err_t audio_out_init(void)
     const rate_profile_t *r = rate_get();
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num  = AP_DMA_DESC_NUM;
+    // THE RING: AP_RING_FRAMES of DMA buffers in a closed loop, 4096 frames =
+    // 85 ms at 48 kHz, 42 ms at 96 kHz. dma_frames only sets the interrupt
+    // rate (3000/s). auto_clear zeroes each buffer after it has played.
+    chan_cfg.dma_desc_num  = AP_RING_FRAMES / r->dma_frames;
     chan_cfg.dma_frame_num = r->dma_frames;
-    chan_cfg.auto_clear    = true;   // emit silence, not stale DMA, on underflow
+    chan_cfg.auto_clear    = true;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx, NULL));
 
     i2s_tdm_config_t tdm_cfg = {
@@ -198,7 +193,10 @@ esp_err_t audio_out_init(void)
                  r->label, (unsigned)(r->hz / 2));
     }
 
-    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = on_send_q_ovf };
+    // Registered before the channel starts: the first lap of interrupts is how
+    // the ring learns its buffer addresses (the DMA starts at descriptor 0).
+    jb_attach_dma(chan_cfg.dma_desc_num, chan_cfg.dma_frame_num);
+    const i2s_event_callbacks_t cbs = { .on_sent = on_sent };
     i2s_channel_register_event_callback(s_tx, &cbs, NULL);
 
     // Audio port first (it sets the APLL), then the SCKI generator.
@@ -207,61 +205,30 @@ esp_err_t audio_out_init(void)
     ESP_LOGI(TAG, "I2S TDM8 @ %s: %d-bit slots, BCK %d fs = %.3f MHz",
              r->label, AP_SLOT_BIT_WIDTH, r->bck_fs,
              r->bck_fs * (double)r->hz / 1e6);
-    ESP_LOGI(TAG, "DMA %u frames x %u = %u frames / %.2f ms depth",
-             r->dma_frames, AP_DMA_DESC_NUM, r->dma_depth_frames,
+    ESP_LOGI(TAG, "DMA plays the ring: %u x %u frames; lead %u frames / %.2f ms",
+             (unsigned)chan_cfg.dma_desc_num, r->dma_frames, r->dma_depth_frames,
              r->dma_depth_frames * 1000.0 / r->hz);
     return ESP_OK;
 }
 
+// NOT an audio pump any more: the DMA plays the ring by itself. This is the
+// media clock's service loop (10 Hz) and the output meter, with no deadline --
+// a late wake-up costs nothing but a late servo update.
 static void audio_task(void *arg)
 {
     (void)arg;
-    const rate_profile_t *r = rate_get();
-    const uint32_t frames = r->dma_frames;
-    const size_t   bytes  = (size_t)frames * AP_NCH * sizeof(int32_t);
-    size_t written;
-
-    // Prime the DMA with silence so the converter has something valid to emit
-    // before the first packet lands.
-    memset(s_block, 0, bytes);
-    for (int i = 0; i < AP_DMA_DESC_NUM; i++) {
-        i2s_channel_write(s_tx, s_block, bytes, &written, portMAX_DELAY);
-    }
-
+    const TickType_t period = pdMS_TO_TICKS(1000 / AP_MCLK_UPDATE_HZ);
+    TickType_t last = xTaskGetTickCount();
     for (;;) {
-        int64_t t0 = esp_timer_get_time();
-        jb_read(s_block, frames);
-        int64_t t1 = esp_timer_get_time();
-
-        // Output meter: what goes to the DAC, on every 8th block -- a level
-        // display needs no more, and it was ~48 us per block. Signal here and silence from the
-        // speaker means the DAC side (control port, wiring, power, AMUTEI).
-        if ((s_blocks & 7) == 0)
-        for (uint32_t f = 0; f < frames; f++) {
-            for (int c = 0; c < AP_NCH; c++) {
-                int32_t v = s_block[f * AP_NCH + c];
-                uint32_t a = (uint32_t)(v < 0 ? -(int64_t)v : v);
-                if (a > s_peak_out[c]) s_peak_out[c] = a;
-            }
-        }
-
-        // BLOCKING WRITE IS THE PACING. i2s_channel_write returns when the DMA
-        // has room, so this loop runs at exactly the media clock rate and
-        // nothing else in the system decides when audio moves. Do not replace
-        // it with a timer, and do not add a queue in front of it.
-        int64_t t2 = esp_timer_get_time();
-        i2s_channel_write(s_tx, s_block, bytes, &written, portMAX_DELAY);
-        int64_t t3 = esp_timer_get_time();
-        s_blocks++;
-
+        vTaskDelayUntil(&last, period);
         mclk_tick();
-        int64_t t4 = esp_timer_get_time();
-        // Worst case of each stage since the last telemetry read: the audio
-        // task has (desc_num - 1) blocks of slack -- 0.33 ms at 96 kHz / 16.
-        if (t1 - t0 > s_prof[0]) s_prof[0] = (uint32_t)(t1 - t0);
-        if (t2 - t1 > s_prof[1]) s_prof[1] = (uint32_t)(t2 - t1);
-        if (t4 - t3 > s_prof[2]) s_prof[2] = (uint32_t)(t4 - t3);
-        if (t3 - t2 > s_prof[3]) s_prof[3] = (uint32_t)(t3 - t2);
+
+        // Output meter: the buffer the DMA is playing now. Signal here and
+        // silence from the speaker means the DAC side (control port, wiring,
+        // power, AMUTEI).
+        uint32_t pk[AP_NCH];
+        jb_peek_peaks(pk);
+        for (int c = 0; c < AP_NCH; c++) if (pk[c] > s_peak_out[c]) s_peak_out[c] = pk[c];
     }
 }
 

@@ -145,7 +145,6 @@
 // exactly on that limit.
 #define AP_BLOCKS_PER_S     3000
 #define AP_DMA_FRAMES_MAX   (AP_RATE_MAX / AP_BLOCKS_PER_S)
-#define AP_DMA_DESC_NUM     3
 
 // Frames per packet we REQUEST from the transmitter.
 //
@@ -185,7 +184,8 @@
 // version of this file hardcoded 1000 us against 1500 us of DMA, which could
 // never have worked.
 //
-// 2 ms is the target. 1 ms is reachable only by dropping AP_DMA_DESC_NUM to 2,
+// (Since the DMA plays the ring, "DMA depth" is only its read-ahead + FIFO.)
+// 2 ms was the target. 1 ms was reachable only by dropping AP_DMA_DESC_NUM to 2,
 // and 0.25 ms is a Brooklyn-3-class capability the FPGA earned with a hardware
 // packetiser -- this is a software receiver on FreeRTOS and its floor is task
 // scheduling, not gate delay.
@@ -217,22 +217,24 @@
 // I2S / DMA
 // ---------------------------------------------------------------------------
 
-// Frames per DMA descriptor, and descriptor count.
+// THE DMA PLAYS THE RING (jitterbuf.h). The I2S DMA walks AP_RING_FRAMES /
+// dma_frames descriptors in a closed loop, and packets are written straight to
+// the slot where they play. dma_frames (16 at 48 kHz, 32 at 96 kHz) now only
+// sets the TX interrupt rate -- 3000/s -- and the position granularity, which
+// the interrupt timestamp interpolates; no task has a deadline per block.
 //
-// Sized by TIME so the audio task wakes at 3000 Hz at either sample rate:
-// 16 frames at 48 kHz, 32 at 96 kHz, 1/3 ms each way. (16 at 96 kHz, for a
-// 1 ms latency minimum, was tried and failed -- rate.c.)
+// Two physical constants replace the old DMA depth:
 //
-// 16 IS THE FLOOR, not a round number. The Espressif AES67 work on this same
-// chip found DMA descriptors smaller than 16 frames unreliable under load, so
-// 48 kHz sits exactly on that limit and 44.1 kHz would fall below it.
+//   AP_DMA_AHEAD_FRAMES  how far past the last finished descriptor the DMA
+//                        may already have READ. A packet must land beyond it.
+//   AP_I2S_FIFO_FRAMES   frames between the DMA and the DAC pins (I2S TX
+//                        FIFO). The DAC plays that much behind the DMA.
 //
-// The depth is a CONSTANT offset ahead of the converter, folded into the media
-// clock's phase target (media_clock.c) and into AP_LATENCY_US_MIN above.
-#define AP_DMA_FRAMES       (AP_SAMPLE_RATE / 3000)
-#define AP_DMA_DESC_NUM     3
-#define AP_DMA_DEPTH_FRAMES (AP_DMA_FRAMES * AP_DMA_DESC_NUM)
-#define AP_DMA_DEPTH_US     ((AP_DMA_DEPTH_FRAMES * 1000000) / AP_SAMPLE_RATE)
+// Both are estimates to be tightened on the bench: pkt_late with audio clean
+// says AHEAD is too large; a click with pkt_late = 0 says too small.
+// Their sum, plus the arrival margin, is the minimum latency (rate.c).
+#define AP_DMA_AHEAD_FRAMES 16
+#define AP_I2S_FIFO_FRAMES  8
 
 // Clock rates that result, for reference when you put a scope on it:
 //

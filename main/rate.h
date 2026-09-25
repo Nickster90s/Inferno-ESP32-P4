@@ -22,7 +22,7 @@ typedef struct {
     uint32_t hz;                // 48000 or 96000
     uint16_t fpp;               // frames per packet we request  (hz / 3000)
     uint16_t dma_frames;        // frames per DMA descriptor     (hz / 3000)
-    uint16_t dma_depth_frames;  // dma_frames * AP_DMA_DESC_NUM
+    uint16_t dma_depth_frames;  // DMA lead: read-ahead + I2S FIFO
     uint32_t dma_depth_us;
     uint16_t scki_fs;           // 512 at 48k, 256 at 96k -- same Hz either way
     uint16_t bck_fs;            // 256, always

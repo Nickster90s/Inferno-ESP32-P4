@@ -21,15 +21,20 @@ static uint32_t s_floor_us;                             // transmitters' demand
 #define LAT_NVS_NS   "latency"
 #define LAT_NVS_KEY  "us"
 
+static uint32_t s_force_us;                            // bench override, 0 = off
+
 static uint32_t effective_us(void)
 {
+    if (s_force_us) {
+        uint32_t f = s_force_us;
+        if (f < rate_get()->latency_min_us) f = rate_get()->latency_min_us;
+        return f;
+    }
     uint32_t us = s_cfg_us > s_floor_us ? s_cfg_us : s_floor_us;
     if (us < rate_get()->latency_min_us) us = rate_get()->latency_min_us;
     if (us > AP_LATENCY_US_MAX) us = AP_LATENCY_US_MAX;
     return us;
 }
-static uint32_t s_block_count;
-static uint32_t s_blocks_per_update;
 static uint32_t s_last_ptp_steps;
 
 esp_err_t mclk_init(uint32_t dma_depth_frames)
@@ -42,13 +47,6 @@ esp_err_t mclk_init(uint32_t dma_depth_frames)
     }
     s_latency_us = effective_us();
     g_mclk.latency_frames   = (uint32_t)((uint64_t)s_latency_us * rate_hz() / 1000000);
-
-    // One servo update every AP_MCLK_UPDATE_HZ; the audio task calls us once
-    // per I2S block. Blocks/s is AP_BLOCKS_PER_S by construction at either
-    // rate, but derive it rather than assume it.
-    uint32_t blocks_per_s = rate_hz() / rate_get()->dma_frames;
-    s_blocks_per_update = blocks_per_s / AP_MCLK_UPDATE_HZ;
-    if (s_blocks_per_update == 0) s_blocks_per_update = 1;
 
     return mclk_hw_init();
 }
@@ -102,16 +100,23 @@ void mclk_set_latency_floor_us(uint32_t us)
 
 uint32_t mclk_get_config_latency_us(void) { return s_cfg_us; }
 
+void mclk_force_latency_us(uint32_t us)
+{
+    s_force_us = us;
+    ESP_LOGW(TAG, "latency override %s %u us", us ? "ON" : "off", (unsigned)us);
+    apply_latency();
+}
+
 uint32_t mclk_get_latency_us(void) { return s_latency_us; }
 
 void mclk_anchor(void)
 {
     uint64_t now;
+    if (!jb_ready()) return;                  // ring still learning its buffers
     if (!mclk_now_samples(&now)) return;
 
-    // The frame handed to DMA now is converted dma_depth frames later, so the
-    // pointer sits that much AHEAD of the sample the DAC is emitting. Constant
-    // offset, folded into the target once here rather than in the error term.
+    // jb_playout_idx() is the sample at the DAC now (the DMA plays the ring),
+    // so dma_depth is 0 and the target is simply now - latency.
     uint64_t playout = now - g_mclk.latency_frames + g_mclk.dma_depth_frames;
     jb_reset(playout);
 
@@ -142,8 +147,6 @@ bool mclk_is_armed(void) { return g_mclk.armed; }
 
 void mclk_tick(void)
 {
-    if (++s_block_count < s_blocks_per_update) return;
-    s_block_count = 0;
 
     if (!g_ptpv1.locked) {
         // PTP is the timeline. Without it the error term is meaningless, so

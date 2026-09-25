@@ -4,12 +4,13 @@
 
 static const char *TAG = "rate";
 
-// Latency margin over the DMA depth.
+// Arrival margin on top of the DMA's lead (read-ahead + I2S FIFO).
 //
-// The playout pointer sits at (now - latency + dma_depth), so the ring is only
-// read for samples that have had (latency - dma_depth) to arrive. Below that
-// the device underruns on every block with PTP locked and every other counter
-// healthy -- which is why this is derived and not a number someone picked.
+// The DMA plays the ring directly (jitterbuf.h), so a packet stamped T only has
+// to land before the DMA reads slot T + latency. It is sent fpp samples after
+// T (0.33 ms at 48/fpp16 and 96/fpp32) and crosses the network and our
+// receive path. 0.5 ms covers that for now; stage 2 (audio decoded in the EMAC
+// task) is what lets it shrink.
 #define LATENCY_MARGIN_US   500
 
 static const rate_profile_t s_profiles[] = {
@@ -128,7 +129,7 @@ esp_err_t rate_select(void)
     for (size_t i = 0; i < sizeof(s_profiles) / sizeof(s_profiles[0]); i++) {
         if (s_profiles[i].hz == want) {
             s_current = s_profiles[i];
-            s_current.dma_depth_frames = s_current.dma_frames * AP_DMA_DESC_NUM;
+            s_current.dma_depth_frames = AP_DMA_AHEAD_FRAMES + AP_I2S_FIFO_FRAMES;
             s_current.dma_depth_us =
                 (uint32_t)((uint64_t)s_current.dma_depth_frames * 1000000 / s_current.hz);
             s_current.latency_min_us = s_current.dma_depth_us + LATENCY_MARGIN_US;
@@ -147,9 +148,9 @@ esp_err_t rate_select(void)
                      s_current.scki_fs, s_current.scki_fs * (double)s_current.hz / 1e6);
             ESP_LOGI(TAG, "  PCM1690 fmt 0x%02x (%s TDM)", s_current.pcm1690_fmt,
                      s_current.pcm1690_fmt == 0x08 ? "24-bit high-speed I2S" : "24-bit I2S");
-            ESP_LOGI(TAG, "  fpp %u, %u pps, DMA %u x %u = %u frames / %u us",
+            ESP_LOGI(TAG, "  fpp %u, %u pps; DMA plays the ring: %u x %u frames, lead %u frames / %u us",
                      s_current.fpp, (unsigned)(s_current.hz / s_current.fpp),
-                     s_current.dma_frames, AP_DMA_DESC_NUM,
+                     (unsigned)(AP_RING_FRAMES / s_current.dma_frames), s_current.dma_frames,
                      s_current.dma_depth_frames, (unsigned)s_current.dma_depth_us);
             ESP_LOGI(TAG, "  latency     %u..%u us",
                      (unsigned)s_current.latency_min_us, AP_LATENCY_US_MAX);

@@ -3,6 +3,7 @@
 #include "eth_ts.h"
 #include "esp_system.h"
 #include <math.h>
+#include <stdlib.h>
 #include "app_config.h"
 #include "rate.h"
 #include "ptpv1.h"
@@ -80,7 +81,7 @@ static int build_stats(char *out, size_t cap)
         "uptime_ms=%u\n"
         "reset_reason=%d\n"
         "eth_rx_kicks=%u\n"
-        "eth_rx_restarts=%u\neth_fifo_hang_reboots=%u\ni2s_underruns=%u\n"
+        "eth_rx_restarts=%u\neth_fifo_hang_reboots=%u\ndma_isr_gaps=%u\n"
         "eth_phy_resets=%u\n"
         "rate_hz=%u\n"
         "rate_pin=%d\n"
@@ -144,7 +145,7 @@ static int build_stats(char *out, size_t cap)
         // 6 task WDT, 7 other WDT, 9 brown-out. Anything but 1/3 after a
         // silent reboot is a crash, and says which kind.
         (int)esp_reset_reason(),
-        (unsigned)eth_ts_rx_kicks(), (unsigned)eth_ts_rx_restarts(), (unsigned)eth_ts_fifo_hang_reboots(), (unsigned)audio_out_i2s_underruns(), (unsigned)eth_ts_phy_resets(),
+        (unsigned)eth_ts_rx_kicks(), (unsigned)eth_ts_rx_restarts(), (unsigned)eth_ts_fifo_hang_reboots(), (unsigned)jb.isr_gaps, (unsigned)eth_ts_phy_resets(),
         (unsigned)rate_hz(), rate_pin_level(), (int)rate_is_pinned(),
         (unsigned)rate_get()->fpp,
         g_ptpv1.locked, g_ptpv1.have_master,
@@ -190,11 +191,8 @@ static int build_stats(char *out, size_t cap)
             n += snprintf(out + n, cap - n, "%d%s", db, c + 1 < AP_NCH ? "," : "\n");
         }
     }
-    uint32_t prof[4];
-    audio_out_take_profile(prof);
     if ((size_t)n < cap)
-        n += snprintf(out + n, cap - n, "audio_max_us=%u,%u,%u,%u\n",
-                      (unsigned)prof[0], (unsigned)prof[1], (unsigned)prof[2], (unsigned)prof[3]);
+        n += snprintf(out + n, cap - n, "dma_isr_max_us=%u\n", (unsigned)jb_take_isr_max_us());
     return n;
 }
 
@@ -247,7 +245,12 @@ static void telem_task(void *arg)
         char q[8];
         int qn = recvfrom(stats, q, sizeof(q), MSG_DONTWAIT,
                           (struct sockaddr *)&from, &flen);
-        if (qn > 0 && q[0] == 'L') {
+        if (qn > 0 && q[0] == 'F') {
+            q[qn < (int)sizeof(q) ? qn : (int)sizeof(q) - 1] = 0;
+            mclk_force_latency_us((uint32_t)atoi(q + 1));
+            int len = snprintf(txt, sizeof(txt), "latency %u us\n", (unsigned)mclk_get_latency_us());
+            sendto(stats, txt, (size_t)len, 0, (struct sockaddr *)&from, flen);
+        } else if (qn > 0 && q[0] == 'L') {
             // Request log (reqlog.c): what controllers have been asking.
             int len = reqlog_dump(txt, sizeof(txt));
             sendto(stats, txt, (size_t)(len > 0 ? len : 1), 0, (struct sockaddr *)&from, flen);

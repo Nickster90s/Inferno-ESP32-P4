@@ -63,8 +63,12 @@ uint32_t mclk_get_config_latency_us(void);
 void     mclk_set_latency_floor_us(uint32_t us); // from the subscriber
 uint32_t mclk_get_latency_us(void);              // effective
 
-// Called from the audio task, once per I2S block. Runs the PI loop at
-// AP_MCLK_UPDATE_HZ and does nothing on the other calls.
+// BENCH ONLY: force the effective latency, ignoring configured and floor
+// (still clamped to the minimum). 0 turns it off. Telemetry port 7779, "F<us>".
+// For finding the real floor below what a transmitter such as a DVS demands.
+void mclk_force_latency_us(uint32_t us);
+
+// Called by audio_out's service task at AP_MCLK_UPDATE_HZ.
 void mclk_tick(void);
 
 #endif // MEDIA_CLOCK_H

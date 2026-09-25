@@ -24,7 +24,7 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
         esp_eth esp_netif esp_timer esp_driver_i2s esp_driver_spi esp_driver_i2c esp_driver_gpio
-        lwip mdns nvs_flash esp_hw_support driver console vfs
+        lwip mdns nvs_flash esp_hw_support driver console vfs esp_mm
 )
 
 # Sample rate.

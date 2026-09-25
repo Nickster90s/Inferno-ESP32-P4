@@ -24,7 +24,7 @@ virtual soundcard (DVS) on a Mac as the transmitter:
 | patching | adding or removing a channel causes **0 underruns** on channels already playing |
 | audio | DVS → P4 → PCM1690 → jack, heard on J5 |
 | sample rate | 48 / 96 kHz selected in the controller; 96 kHz: 0 I2S underruns, 0 playout steps over 5 min |
-| latency | device setting 2 ms (no "custom" warning); receive flow and measured latency reported |
+| latency | device setting 2 ms (no "custom" warning); receive flow and measured latency reported; the DMA plays the ring, clean down to 1.75 ms from a DVS |
 | long run | see [Measured](#measured); a soak test after the transmit fix below is in progress |
 
 Open issues are listed under [Known issues](#known-issues).
@@ -404,8 +404,8 @@ Three numbers, kept apart as a real device keeps them (`media_clock.h`):
 
 Reporting the effective value as the setting made the controller show "This
 device is using a custom latency" (4 ms is not a preset). The **minimum**
-(key 0x8306) decides which presets the controller offers: it is DMA depth +
-0.5 ms arrival margin = **1.5 ms**, so the controller offers 2 and 5 ms.
+(key 0x8306) decides which presets the controller offers: it is the DMA's
+lead + 0.5 ms arrival margin (see below).
 
 The **Latency tab** needs two things. ARC 0x3200 must list the receive flows
 (port, channels per slot, rate, latency); an empty list reads "No Receive
@@ -414,12 +414,43 @@ latency in samples: the running maximum of (now − packet timestamp) at
 receipt, taken while PTP is locked (inferno `flows_rx.rs`; FPGA
 `docs/LATENCY.md`). From the DVS at 96 kHz: about 200 samples (~2.1 ms).
 
-**A 1 ms minimum at 96 kHz was tried and failed.** It needs 16-frame DMA
-blocks (0.5 ms of depth), which leaves the I2S task 0.33 ms of slack; `emac_rx`
-preempts it for up to ~0.2 ms through receive bursts. The bench showed
-hundreds of I2S underruns a minute, write stalls up to 100 ms, and PTP losing
-lock. Getting below 1.5 ms needs a different audio path (the DMA playing
-straight from the jitter buffer), not a smaller block.
+### The DMA plays the jitter buffer
+
+The I2S DMA plays the ring **directly**. The ring *is* the I2S driver's DMA
+buffers: 4096 frames in a closed descriptor loop (85 ms at 48 kHz, 42 ms at
+96 kHz). A packet is written straight to the slot where it will play,
+`timestamp + latency`, with a cache writeback, and the driver zeroes every
+buffer once played (`auto_clear`), so an empty slot plays silence and nothing
+old can come round again. The TX interrupt (3–5 µs, 3000/s) reports each
+finished descriptor; the first lap learns the buffer addresses, and the time
+since the last interrupt interpolates the position the media clock compares
+against PTP (`jitterbuf.c`).
+
+There is **no audio-copying task and so no per-block deadline**, which is
+what limited the old design: a task copied the ring into 3 DMA blocks, 1 ms of
+depth, and making the blocks smaller for a lower latency starved it (16-frame
+blocks at 96 kHz: hundreds of I2S underruns a minute, stalls up to 100 ms, PTP
+lost). Now the only rule is that a packet lands before the DMA reaches it.
+
+The minimum is the DMA's lead (read-ahead `AP_DMA_AHEAD_FRAMES` + I2S FIFO
+`AP_I2S_FIFO_FRAMES`, 24 frames) plus a 0.5 ms arrival margin: **0.75 ms at
+96 kHz, 1.0 ms at 48 kHz**, so the controller offers 1 ms.
+
+Latency sweep from the DVS at 96 kHz, forcing the effective latency below the
+DVS's own 4 ms demand (bench override, UDP 7779 `F<us>`, 20 s per step):
+
+| latency | late packets | underrun frames |
+|---|---|---|
+| 4.0 – 1.75 ms | **0** | **0** |
+| 1.5 ms | 0.01 % | 128 |
+| 1.25 ms | 0.39 % | 5 028 |
+| 1.0 ms | 11.6 % | heavy |
+
+The phase error stayed at 0–3 frames with no steps throughout. Late packets
+start where the DVS's own send timing runs out; a hardware transmitter is
+needed to find the receiver's real floor below 1.5 ms. Next step (stage 2):
+decode audio in the EMAC receive task instead of through lwIP, sockets and a
+task, which takes the receive path's jitter out of the margin.
 
 ## Measured
 
@@ -460,8 +491,8 @@ The fields that matter most:
 | `eth_rx_kicks`, `eth_rx_restarts`, `eth_phy_resets` | receive watchdog actions (should stay 0) |
 | `reset_reason` | why the board last started: 1 power-on, 3 software, 4 panic, 5–7 watchdog, 9 brown-out |
 | `peak_in_dbfs`, `peak_out_dbfs` | per-channel level from the network and to the DAC, since last read |
-| `i2s_underruns` | the DMA found no fresh block: the audio task was late (should stay 0) |
-| `audio_max_us` | worst-case µs since last read: `jb_read`, meter, `mclk_tick`, I2S write wait |
+| `dma_isr_gaps` | TX interrupts that covered more than one descriptor (should stay 0) |
+| `dma_isr_max_us` | longest TX interrupt since last read (3–5 µs) |
 | `rx_lat_max_samples` | highest (now − packet timestamp) at receipt since boot |
 | `mclk_latency_us`, `mclk_latency_cfg_us` | effective and configured latency |
 | `eth_fifo_hang_reboots` | reboots forced by the RX FIFO hang |
@@ -498,7 +529,7 @@ Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
 | `eth_ts.[ch]` | EMAC bring-up, hardware timestamps, multicast filter |
 | `ptpv1.[ch]`, `ptp_servo.[ch]` | PTPv1 slave, staged acquisition, PI servo |
 | `media_clock.[ch]`, `mclk_hw.[ch]` | playout phase, feed-forward, APLL trim |
-| `jitterbuf.[ch]` | timestamp-indexed ring, 64-bit indices |
+| `jitterbuf.[ch]` | timestamp-indexed ring = the I2S DMA buffers, played directly; position from the TX interrupt |
 | `aoip_rx.[ch]` | audio sockets, keepalive, input meters |
 | `audio_out.[ch]` | I2S TDM8, SCKI = BCK routing, output meters |
 | `pcm1690.[ch]` | DAC control (SPI, I2C detected), USB pad release, pin check |
@@ -532,7 +563,9 @@ Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
    data: it does not block.
 6. **The heartbeat meters are zeros**, so the controller shows no levels. The
    board now has real per-channel peaks to report.
-7. **Minimum latency 1.5 ms**, so no 1 ms preset (see [Latency](#latency)).
+7. **Sub-millisecond latency is untested**: the receiver's minimum is now
+   0.75 ms at 96 kHz, but the only transmitter on the bench (a DVS) demands
+   4 ms and its own timing breaks down below ~1.5 ms.
 
 ## Lessons carried across
 
