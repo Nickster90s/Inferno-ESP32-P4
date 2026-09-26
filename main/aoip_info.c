@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include <math.h>
 
 static const char *TAG = "info";
 
@@ -137,10 +138,17 @@ static void send_heartbeat(void)
     put_u32(p, n + 28, 0); put_u32(p, n + 32, 0);
     n += 36;
 
-    // 0x8002: per-channel peaks, one byte each, tx first then rx, padded to 4.
-    // Zero: honest "no meter". RECEIVER: 0 tx, AP_NCH rx.
+    // 0x8002: per-channel peaks, one byte each, tx first then rx, padded to 4
+    // -- what the controller's signal indicators and meters read. RECEIVER:
+    // 0 tx, AP_NCH rx, the audio received per channel since the last
+    // heartbeat. Encoding (inferno peaks.rs): round(-40 * log10(peak / full
+    // scale)), i.e. attenuation in HALF-dB steps: 0 = full scale, 255 =
+    // silence. An all-zero block, which this used to send, reads as every
+    // channel at full scale.
     {
         const uint16_t ntx = 0, nrx = AP_NCH, npk = ntx + nrx;
+        uint32_t pk[AP_NCH];
+        aoip_rx_take_peaks_hb(pk);
         const uint16_t pad = (uint16_t)((4u - (npk & 3u)) & 3u);
         put_u16(p, n, (uint16_t)(24 + npk + pad)); put_u16(p, n + 2, 0x8002);
         put_u16(p, n + 4, 4); put_u16(p, n + 6, (uint16_t)(12 + npk));
@@ -149,6 +157,14 @@ static void send_heartbeat(void)
         put_u16(p, n + 16, nrx); put_u16(p, n + 18, 0);
         put_u16(p, n + 20, 24);  put_u16(p, n + 22, 0);
         memset(p + n + 24, 0, npk + pad);
+        for (uint16_t c = 0; c < nrx; c++) {
+            uint8_t v = 255;
+            if (pk[c]) {
+                float db2 = -40.0f * log10f((float)pk[c] / 8388608.0f);
+                v = db2 <= 0.0f ? 0 : db2 >= 255.0f ? 255 : (uint8_t)(db2 + 0.5f);
+            }
+            p[n + 24 + ntx + c] = v;
+        }
         n += 24 + npk + pad;
     }
 

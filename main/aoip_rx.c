@@ -43,6 +43,7 @@ static flow_t s_flows[AP_MAX_FLOWS];
 // Guards nslots / slot_to_ch against aoip_rx_remap_flow() on the other core.
 static portMUX_TYPE s_map_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_peak_in[AP_NCH];     // max |sample|, 24-bit, since last take
+static volatile uint32_t s_peak_hb[AP_NCH];     // the same, for the heartbeat's meters
 static aoip_rx_stats_t s_st;
 static uint8_t s_rxbuf[1600];
 
@@ -105,6 +106,7 @@ static void handle_packet(flow_t *fl, const uint8_t *buf, int len)
             if (a > pk) pk = a;
         }
         s_peak_in[ch] = pk;
+        if (pk > s_peak_hb[ch]) s_peak_hb[ch] = pk;
     }
 
     fl->packets++;
@@ -247,6 +249,13 @@ void aoip_rx_get_stats(aoip_rx_stats_t *out) { *out = s_st; }
 void aoip_rx_take_peaks(uint32_t out[AP_NCH])
 {
     for (int c = 0; c < AP_NCH; c++) { out[c] = s_peak_in[c]; s_peak_in[c] = 0; }
+}
+
+// A second, independent accumulator: telemetry and the heartbeat each take
+// (and reset) their own, so neither steals the other's peaks.
+void aoip_rx_take_peaks_hb(uint32_t out[AP_NCH])
+{
+    for (int c = 0; c < AP_NCH; c++) { out[c] = s_peak_hb[c]; s_peak_hb[c] = 0; }
 }
 
 uint32_t aoip_rx_take_latency(uint8_t idx)

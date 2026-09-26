@@ -209,6 +209,20 @@ static bool resolve_cached(uint8_t c, const rx_channel_t *ch, tx_channel_t *out)
     return true;
 }
 
+// Forget a transmitter's cached resolution. Called when its flow dies or a
+// request to it fails: a transmitter that rebooted may be on a NEW link-local
+// address, and retrying the cached one was a dead end -- the patch stayed
+// pending for good while a RedNet AM2 on the same bench re-resolved and
+// recovered.
+static void forget_device(const char *dev)
+{
+    for (uint8_t c = 0; c < AP_NCH; c++)
+        if (s_res[c].valid && strcmp(s_res[c].tx_device, dev) == 0) {
+            s_res[c].valid = false;
+        }
+    ESP_LOGI(TAG, "%s: resolution dropped, will look it up again", dev);
+}
+
 // ---------------------------------------------------------------------------
 // INCREMENTAL rebuild.
 //
@@ -427,6 +441,7 @@ static void rebuild(void)
             activate_slots(f);
         } else {
             s_st.requests_failed++;
+            forget_device(w->device);
             aoip_rx_unbind_flow((uint8_t)i);
             f->device[0] = 0;
             ESP_LOGW(TAG, "flow to %s refused; retrying%s", w->device,
@@ -488,7 +503,10 @@ static void sub_task(void *arg)
                 ESP_LOGW(TAG, "flow %d: no audio for %d ms -- re-requesting",
                          i, KEEPALIVE_MS);
                 // Drop it FIRST: rebuild() leaves a flow whose channel list is
-                // unchanged alone, and a dead one looks exactly like that.
+                // unchanged alone, and a dead one looks exactly like that. And
+                // look the transmitter up again: it may have rebooted onto a
+                // new address.
+                forget_device(f->device);
                 tear_down((uint8_t)i);
                 s_dirty = true;
             }

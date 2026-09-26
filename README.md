@@ -20,7 +20,8 @@ virtual soundcard (DVS) on a Mac as the transmitter:
 |---|---|
 | discovery | appears in AoIP Controller with name, model, IP, 8 RX channels |
 | clock | PTPv1 locked, Sync **green about 15 s after power-on** |
-| subscription | patch goes **green**; restored from flash after a reboot |
+| subscription | patch goes **green**; restored from flash after a reboot; re-established when the transmitter reboots onto a new link-local address |
+| meters | per-channel signal levels shown in the controller |
 | patching | adding or removing a channel causes **0 underruns** on channels already playing |
 | audio | DVS → P4 → PCM1690 → jack, heard on J5 |
 | sample rate | 48 / 96 kHz selected in the controller; 96 kHz: 0 I2S underruns, 0 playout steps over 5 min |
@@ -372,6 +373,19 @@ Most of the control-plane layouts come from the FPGA project (`../FPGA`),
 which was brought up against the same controller, an AM2, an A16R and DVS.
 The AM2's replies were replayed and diffed on this bench.
 
+**A transmitter that reboots onto a new address.** Resolutions are cached per
+channel so a patch does not re-resolve the others. When a flow stops
+delivering (3 s) or a request to its transmitter fails, that transmitter's
+cached resolution is now dropped, so the retry resolves it again over mDNS.
+Before, the retry kept asking the old link-local address: the patch stayed
+pending for good while a RedNet AM2 on the same bench recovered.
+
+**Level meters.** The heartbeat's 0x8002 block carries one byte per channel:
+`round(-40 · log10(peak / full scale))`, attenuation in half-dB steps, 0 = full
+scale, 255 = silence (inferno `peaks.rs`). It used to be all zeros, which reads
+as every channel at full scale. It now carries the peak received per channel
+since the previous heartbeat (1 s).
+
 ## Sample rates: 48 and 96 kHz, chosen in the controller
 
 The controller's sample-rate menu works. The board advertises 48 and 96 kHz
@@ -561,11 +575,11 @@ Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
    lost six times in two minutes, so tracing is compiled out
    (`AP_PTP_TRACE=0`). Use the telemetry stream (UDP 7778) for per-sample
    data: it does not block.
-6. **The heartbeat meters are zeros**, so the controller shows no levels. The
-   board now has real per-channel peaks to report.
-7. **Sub-millisecond latency is untested**: the receiver's minimum is now
-   0.75 ms at 96 kHz, but the only transmitter on the bench (a DVS) demands
-   4 ms and its own timing breaks down below ~1.5 ms.
+6. **Sub-millisecond latency is untested**: the receiver's minimum is now
+   0.75 ms at 96 kHz, but the software transmitters on the bench cannot go
+   that low. The macOS DVS is clean to 1.75 ms; Inferno on Linux sends
+   packets 1.6–1.9 ms after their timestamp (occasionally 4 ms) and is clean
+   at 2 ms.
 
 ## Lessons carried across
 

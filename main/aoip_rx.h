@@ -50,4 +50,8 @@ uint32_t aoip_rx_flow_packets(uint8_t idx);
 // then reset -- the per-flow latency the heartbeat reports. 0 if inactive.
 uint32_t aoip_rx_take_latency(uint8_t idx);
 
+// Per-channel peak since the last call (24-bit full scale 2^23), for the
+// heartbeat's meters -- separate from aoip_rx_take_peaks (telemetry).
+void aoip_rx_take_peaks_hb(uint32_t out[AP_NCH]);
+
 #endif // AOIP_RX_H
