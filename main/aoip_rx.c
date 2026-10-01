@@ -5,6 +5,7 @@
 #include "telem.h"
 #include "media_clock.h"
 #include "ptpv1.h"
+#include "eth_ts.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
@@ -24,6 +25,9 @@ typedef struct {
     uint16_t port;
     uint32_t packets;
     volatile int32_t lat_max;       // max (now - timestamp) at receipt, samples
+    uint32_t missed;                // packets lost on the way or dropped late (0x8004)
+    uint64_t next_idx;              // timestamp the next packet should carry
+    bool     have_next;
     struct sockaddr_in src;         // where this flow's audio comes FROM
     bool     have_src;
 } flow_t;
@@ -79,19 +83,33 @@ static void handle_packet(flow_t *fl, const uint8_t *buf, int len)
     // ACTUAL LATENCY, the controller's number: now - timestamp at receipt,
     // kept as a running max until the heartbeat takes it (inferno
     // flows_rx.rs:122; FPGA docs/LATENCY.md 8). A timestamp in the future
-    // clamps to 0, as there. Only while PTP is LOCKED, and nothing over
-    // 50 ms (the protocol maximum is 40): across a PTP step or phase shift `now`
-    // jumps and the difference is the step, not the network (seen: 100-144 ms
-    // in the seconds after lock).
+    // clamps to 0, as there. Nothing over 50 ms (the protocol maximum is 40):
+    // across a PTP step or phase shift `now` jumps and the difference is the
+    // step, not the network (seen: 100-144 ms in the seconds after lock).
+    // NOT gated on "locked": a brief unlock froze the controller's latency
+    // display while the audio played on (mclk_now_samples needs a master).
     uint64_t now;
-    if (g_ptpv1.locked && mclk_now_samples(&now)) {
+    if (mclk_now_samples(&now)) {
         int64_t d = (int64_t)(now - idx);
         if (d > (int64_t)(rate_hz() / 20)) d = 0;
         if (d > fl->lat_max) fl->lat_max = (int32_t)d;
         if (d > s_st.lat_max_samples) s_st.lat_max_samples = (int32_t)d;
     }
 
-    jb_write(idx, nframes, nslots, map, h.samples);
+    // MISSED PACKETS, cumulative per flow -- the heartbeat's 0x8004 word,
+    // which a RedNet AM2 counts up (57, then 62 while 0x8003 moved) and the
+    // controller's Latency tab shows beside the latency. Counted: packets that
+    // never arrived (a timestamp jump of more than one packet) and packets
+    // that arrived too late to play.
+    if (fl->have_next && (int64_t)(idx - fl->next_idx) > 0) {
+        uint64_t gap = (idx - fl->next_idx) / nframes;
+        fl->missed += gap > 1000 ? 1000 : (uint32_t)gap;
+    }
+    if (!fl->have_next || (int64_t)(idx - fl->next_idx) >= 0) {
+        fl->next_idx = idx + nframes;
+        fl->have_next = true;
+    }
+    if (!jb_write(idx, nframes, nslots, map, h.samples)) fl->missed++;
 
     // Input meter: what the transmitter actually sent. Silence here and the
     // fault is upstream (nothing playing into that AoIP channel).
@@ -111,6 +129,48 @@ static void handle_packet(flow_t *fl, const uint8_t *buf, int len)
 
     fl->packets++;
     s_st.packets++;
+}
+
+// ---------------------------------------------------------------------------
+// FAST PATH. eth_ts.c hands us a unicast UDP frame to one of our flow ports in
+// the emac_rx task, straight after the DMA delivered it. We decode it there:
+// the same handle_packet() the socket path uses, into the same ring. What is
+// gone is lwIP's tcpip thread, the socket, select() and this task's wake-up.
+//
+// The socket stays open, bound, for SENDING: the flow keepalive has to come
+// from the audio port. It is never read while the fast path is on. And
+// nothing here may call lwIP -- emac_rx feeds lwIP, so a send from here could
+// wait on the very thread that waits on us. The first packet's keepalive is
+// therefore flagged to the aoip_rx task instead of sent.
+// ---------------------------------------------------------------------------
+static volatile bool s_fast = true;
+static volatile bool s_ka_now;
+
+void aoip_rx_set_fast_path(bool on)
+{
+    s_fast = on;
+    ESP_LOGW(TAG, "audio path: %s", on ? "FAST (EMAC task)" : "socket (lwIP)");
+}
+bool aoip_rx_fast_path(void) { return s_fast; }
+
+static bool fast_input(uint32_t src_ip_be, uint16_t src_port, uint16_t dst_port,
+                       const uint8_t *payload, uint32_t len)
+{
+    if (!s_fast) return false;
+    uint16_t idx = (uint16_t)(dst_port - AOIP_RX_AUDIO_PORT);
+    if (idx >= AP_MAX_FLOWS) return false;
+    flow_t *fl = &s_flows[idx];
+    if (!fl->active || fl->sock < 0) return false;   // not ours now: let lwIP answer
+    if (!fl->have_src) {
+        fl->src.sin_family = AF_INET;
+        fl->src.sin_addr.s_addr = src_ip_be;
+        fl->src.sin_port = htons(src_port);
+        __atomic_store_n(&fl->have_src, true, __ATOMIC_RELEASE);
+        s_ka_now = true;                             // aoip_rx task sends it
+    }
+    handle_packet(fl, payload, (int)len);
+    s_st.fast_packets++;
+    return true;
 }
 
 static void send_keepalives(void)
@@ -135,6 +195,7 @@ static void rx_task(void *arg)
     (void)arg;
     int64_t next_ka = 0;
     for (;;) {
+        if (s_ka_now) { s_ka_now = false; next_ka = 0; }
         int64_t now = esp_timer_get_time();
         if (now >= next_ka) {
             send_keepalives();
@@ -211,6 +272,8 @@ esp_err_t aoip_rx_bind_flow(uint8_t idx, uint8_t nslots, const int8_t *slot_to_c
     fl->fpp     = fpp;
     fl->port    = AOIP_RX_AUDIO_PORT + idx;
     fl->packets = 0;
+    fl->missed = 0;
+    fl->have_next = false;
     fl->have_src = false;
     fl->active  = true;
 
@@ -265,6 +328,11 @@ uint32_t aoip_rx_take_latency(uint8_t idx)
     return v > 0 ? (uint32_t)v : 0;
 }
 
+uint32_t aoip_rx_flow_missed(uint8_t idx)
+{
+    return (idx < AP_MAX_FLOWS && s_flows[idx].active) ? s_flows[idx].missed : 0;
+}
+
 uint32_t aoip_rx_flow_packets(uint8_t idx)
 {
     return idx < AP_MAX_FLOWS ? s_flows[idx].packets : 0;
@@ -273,6 +341,7 @@ uint32_t aoip_rx_flow_packets(uint8_t idx)
 esp_err_t aoip_rx_start(void)
 {
     for (int i = 0; i < AP_MAX_FLOWS; i++) s_flows[i].sock = -1;
+    eth_ts_register_audio_cb(fast_input);
     BaseType_t ok = xTaskCreatePinnedToCore(rx_task, "aoip_rx", 4096, NULL,
                                             AP_PRIO_RX, NULL, AP_CORE_AUDIO);
     return ok == pdPASS ? ESP_OK : ESP_FAIL;

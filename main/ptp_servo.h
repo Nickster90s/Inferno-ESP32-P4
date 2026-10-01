@@ -18,10 +18,15 @@
 // residence time and PTPv1 has no equivalent, so queueing delay lands directly
 // in the offset measurement. Hundreds of ns to low microseconds through a
 // switch, not tens of ns. The thresholds reflect that.
-#define PS_LOCK_NS          2000
-#define PS_UNLOCK_NS        5000
+// Hysteresis wide enough for PTPv1 through a switch: no correction field, so
+// queueing shows up as microseconds of offset jitter. At 2 us / 5 us x 4 the
+// bench flapped (offset sitting at 1.5-1.9 us, a short burst over 5 us
+// unlocked it, and relocking needed 8 Syncs under 2 us) -- Sync red in the
+// controller and the latency display frozen while the audio was fine.
+#define PS_LOCK_NS          3000
+#define PS_UNLOCK_NS        10000
 #define PS_LOCK_STREAK      8
-#define PS_UNLOCK_STREAK    4
+#define PS_UNLOCK_STREAK    8
 #define PS_STEP_NS          1000000LL   // 1 ms, per statime's step_threshold
 
 typedef struct {

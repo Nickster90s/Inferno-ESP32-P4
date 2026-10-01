@@ -187,7 +187,9 @@ static void send_heartbeat(void)
     put_u16(p, n + 8, s_seq); put_u16(p, n + 10, 0);
     put_u16(p, n + 12, nflows); put_u16(p, n + 14, 0);
     put_u16(p, n + 16, 0x0014); put_u16(p, n + 18, 0);
-    memset(p + n + 20, 0, 4 * nflows);
+    // One word per flow slot: packets missed, CUMULATIVE (a RedNet AM2's
+    // counts up: 57, later 62, while its 0x8003 latency moved every second).
+    for (uint16_t i = 0; i < nflows; i++) put_u32(p, n + 20 + 4 * i, aoip_rx_flow_missed((uint8_t)i));
     n += 20 + 4 * nflows;
 
     send_to(GRP_HEARTBEAT, AOIP_PORT_HEARTBEAT, n);

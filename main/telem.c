@@ -127,7 +127,7 @@ static int build_stats(char *out, size_t cap)
         "rx_wrong_len=%u\n"
         "rx_ka_sent=%u\n"
         "rx_ka_failed=%u\n"
-        "rx_ka_errno=%d\nrx_lat_max_samples=%d\n"
+        "rx_ka_errno=%d\nrx_lat_max_samples=%d\nrx_fast_packets=%u\nrx_fast_path=%d\n"
         "fc_last_op=%u\n"
         "fc_last_code=%u\n"
         "fc_refused=%u\n"
@@ -168,7 +168,7 @@ static int build_stats(char *out, size_t cap)
         (unsigned)jb.playout_steps,
         (unsigned)rx.packets, (unsigned)rx.bad_magic, (unsigned)rx.short_pkt,
         (unsigned)rx.wrong_len,
-        (unsigned)rx.ka_sent, (unsigned)rx.ka_failed, (int)rx.ka_last_errno, (int)rx.lat_max_samples,
+        (unsigned)rx.ka_sent, (unsigned)rx.ka_failed, (int)rx.ka_last_errno, (int)rx.lat_max_samples, (unsigned)rx.fast_packets, (int)aoip_rx_fast_path(),
         (unsigned)g_flows_diag.last_opcode, (unsigned)g_flows_diag.last_code,
         (unsigned)g_flows_diag.refused, (unsigned)g_flows_diag.timeouts,
         (unsigned)sub.flows_active, (unsigned)sub.requests_ok,
@@ -245,7 +245,11 @@ static void telem_task(void *arg)
         char q[8];
         int qn = recvfrom(stats, q, sizeof(q), MSG_DONTWAIT,
                           (struct sockaddr *)&from, &flen);
-        if (qn > 0 && q[0] == 'F') {
+        if (qn > 0 && q[0] == 'X') {
+            aoip_rx_set_fast_path(qn > 1 && q[1] == '1');
+            int len = snprintf(txt, sizeof(txt), "fast path %d\n", (int)aoip_rx_fast_path());
+            sendto(stats, txt, (size_t)len, 0, (struct sockaddr *)&from, flen);
+        } else if (qn > 0 && q[0] == 'F') {
             q[qn < (int)sizeof(q) ? qn : (int)sizeof(q) - 1] = 0;
             mclk_force_latency_us((uint32_t)atoi(q + 1));
             int len = snprintf(txt, sizeof(txt), "latency %u us\n", (unsigned)mclk_get_latency_us());

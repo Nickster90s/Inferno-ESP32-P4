@@ -43,6 +43,14 @@ typedef struct {
 // the Ethernet receive task, which is also carrying the audio.
 typedef void (*eth_ts_ptp_cb_t)(const eth_ts_ptp_frame_t *f);
 
+// Audio fast path: called in the emac_rx task for a unicast UDP frame to a
+// port in [AOIP_RX_AUDIO_PORT, + AP_MAX_FLOWS). Return true to consume it
+// (the frame is then freed and never reaches lwIP), false to pass it on.
+// Must not block and must not call into lwIP.
+typedef bool (*eth_ts_audio_cb_t)(uint32_t src_ip_be, uint16_t src_port, uint16_t dst_port,
+                                  const uint8_t *payload, uint32_t len);
+void eth_ts_register_audio_cb(eth_ts_audio_cb_t cb);
+
 esp_err_t eth_ts_init(void);
 esp_err_t eth_ts_start(void);
 

@@ -268,6 +268,23 @@ Acquisition is staged, each stage as early as it can run:
 On a step, the P term is dropped and the servo falls back to its rate estimate.
 Keeping the saturated P term once deadlocked the servo at −200 ppm.
 
+### Joining the PTP group (IGMP)
+
+The EMAC's multicast filter admits 224.0.1.129 from link-up, but the board
+never sent an IGMP join for it. That held while the clock leader (a RedNet
+AM2) shared an unmanaged switch with us. When a leader elsewhere took over,
+the board received **0 Syncs**: no master, every audio packet discarded,
+silence at the DAC. `main.c` now joins the group once there is an address;
+lwIP answers the switch's queries from then on. Syncs and lock within ~30 s of
+power-on.
+
+### Lock hysteresis
+
+PTPv1 has no correction field, so switch queueing shows up as microseconds of
+offset jitter. With lock < 2 µs and unlock after 4 Syncs > 5 µs, the bench
+flapped while the offset sat at 1.5–1.9 µs. Now lock < 3 µs (8 in a row),
+unlock after 8 in a row > 10 µs: over 3 minutes, unlocked once (at boot).
+
 ### Outliers and phase shifts (the old "71 s step")
 
 When an audio flow starts, the Leader-to-us delay drops by **~36 µs and stays
@@ -386,6 +403,13 @@ scale, 255 = silence (inferno `peaks.rs`). It used to be all zeros, which reads
 as every channel at full scale. It now carries the peak received per channel
 since the previous heartbeat (1 s).
 
+**Latency and missed packets.** The heartbeat's 0x8003 block carries each
+flow's highest (now − timestamp) in samples over the last second; 0x8004
+carries each flow's **cumulative** count of missed packets (never arrived, or
+too late to play). A RedNet AM2's 0x8004 counts up (57, later 62) while its
+0x8003 moves every second. The latency measurement is not gated on PTP lock:
+gating it froze the controller's display through every brief unlock.
+
 ## Sample rates: 48 and 96 kHz, chosen in the controller
 
 The controller's sample-rate menu works. The board advertises 48 and 96 kHz
@@ -462,9 +486,32 @@ DVS's own 4 ms demand (bench override, UDP 7779 `F<us>`, 20 s per step):
 
 The phase error stayed at 0–3 frames with no steps throughout. Late packets
 start where the DVS's own send timing runs out; a hardware transmitter is
-needed to find the receiver's real floor below 1.5 ms. Next step (stage 2):
-decode audio in the EMAC receive task instead of through lwIP, sockets and a
-task, which takes the receive path's jitter out of the margin.
+needed to find the receiver's real floor below 1.5 ms.
+
+### Audio decoded in the EMAC receive task
+
+`eth_ts.c` already sees every frame in IDF's `emac_rx` task (that is how PTP
+gets its hardware timestamp). A unicast UDP frame to one of the flow ports
+(`AOIP_RX_AUDIO_PORT + idx`) is now handed straight to `aoip_rx.c`, decoded
+into the ring there, and freed: it never reaches lwIP's tcpip thread, the
+socket, `select()` or the `aoip_rx` task. The socket stays bound only to SEND
+the flow keepalive from the audio port; nothing in the fast path calls lwIP
+(emac_rx feeds lwIP, so a send from there could wait on itself), so the
+first-packet keepalive is flagged to the `aoip_rx` task. `X0` / `X1` on UDP
+7779 switches between the paths for comparison.
+
+A/B on the same build and source, 2 ms, 60 s windows:
+
+| path | late packets | worst arrival lag per second (median / max) |
+|---|---|---|
+| EMAC task | 0.50–0.53 % | 2.80 / 3.2 ms |
+| socket (lwIP) | 1.80–1.86 % | 3.57 / 4.07 ms |
+
+The lwIP path cost ~0.75 ms. (That source was the FPGA transmitter, whose
+timestamps run ~3 ms behind PTP while it advertises 1 ms: its media clock is
+anchored once and then free-runs, FPGA `docs/LATENCY.md`.) From Inferno on
+Linux at 1 ms, packets arrive 0.2–0.7 ms after their timestamps, with a ~3 ms
+stall every 20–40 s on the sender that costs ~8 packets.
 
 ## Measured
 
@@ -507,6 +554,7 @@ The fields that matter most:
 | `peak_in_dbfs`, `peak_out_dbfs` | per-channel level from the network and to the DAC, since last read |
 | `dma_isr_gaps` | TX interrupts that covered more than one descriptor (should stay 0) |
 | `dma_isr_max_us` | longest TX interrupt since last read (3–5 µs) |
+| `rx_fast_packets`, `rx_fast_path` | packets decoded in the EMAC task; fast path on (1) or socket path (0) |
 | `rx_lat_max_samples` | highest (now − packet timestamp) at receipt since boot |
 | `mclk_latency_us`, `mclk_latency_cfg_us` | effective and configured latency |
 | `eth_fifo_hang_reboots` | reboots forced by the RX FIFO hang |

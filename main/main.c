@@ -32,6 +32,7 @@
 #include "aoip_wire.h"
 
 #include "nvs_flash.h"
+#include "lwip/sockets.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -107,6 +108,23 @@ void app_main(void)
 
     // 5. Control plane -- the only part that needs an address.
     wait_for_ip();
+
+    // IGMP JOIN for the PTP group. The MAC filter above lets Sync in before
+    // there is an address, but a switch with IGMP snooping forwards a group
+    // only to ports that have JOINED it -- and nothing here ever had. It
+    // worked while the clock leader shared an unmanaged switch with us; when a
+    // leader elsewhere took over, not one Sync arrived (bench: 0 Syncs, no
+    // master, every packet discarded, silence). lwIP keeps the membership and
+    // answers the switch's queries for as long as this socket is open.
+    {
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        struct ip_mreq mr = { .imr_multiaddr.s_addr = htonl(PTP1_GROUP_IP),
+                              .imr_interface.s_addr = htonl(INADDR_ANY) };
+        if (s < 0 || setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr)) != 0)
+            ESP_LOGW(TAG, "IGMP join of the PTP group failed");
+        else
+            ESP_LOGI(TAG, "joined PTP group 224.0.1.129 (IGMP)");
+    }
 
     // Identity first: mDNS id= is read from aoip_info.
     ESP_ERROR_CHECK(aoip_info_start());

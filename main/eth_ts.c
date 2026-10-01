@@ -16,6 +16,7 @@
 #include "lwip/ip4_addr.h"
 #include "lwip/sockets.h"
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 static const char *TAG = "eth_ts";
@@ -27,6 +28,7 @@ static esp_netif_t      *s_netif;
 static uint8_t           s_our_mac[6];
 static volatile bool     s_link_up;
 static eth_ts_ptp_cb_t   s_ptp_cb;
+static eth_ts_audio_cb_t s_audio_cb;
 static int32_t           s_rate_ppb;
 
 // ---------------------------------------------------------------------------
@@ -34,9 +36,13 @@ static int32_t           s_rate_ppb;
 // ---------------------------------------------------------------------------
 //
 // This hook replaces the default stack input so that a frame can be examined
-// WITH its hardware timestamp before lwIP ever sees it. Audio does not come
-// through here -- it goes to a normal UDP socket -- because audio does not need
-// a receive timestamp. Only PTP does.
+// WITH its hardware timestamp before lwIP ever sees it -- PTP needs that.
+//
+// AUDIO IS DECODED HERE TOO (stage 2): a unicast UDP frame to one of our flow
+// ports goes straight to the audio callback, in the emac_rx task, a few
+// microseconds after the DMA delivered it, and is freed here. It never
+// reaches lwIP, the socket, select() or the aoip_rx task -- four hand-offs
+// whose timing jitter used to sit in the latency margin.
 
 static inline bool is_ptpv1_frame(const uint8_t *f, uint32_t len,
                                   const uint8_t **payload, uint32_t *plen,
@@ -80,11 +86,48 @@ static volatile uint32_t s_rx_frames;      // every frame the EMAC delivered
 static uint32_t s_rx_kicks, s_rx_restarts, s_phy_resets;
 static uint32_t s_rx_dma_state, s_rx_missed, s_rx_fifo_ovf;
 
+// Plain unicast IPv4/UDP, unfragmented, to a port in [lo, lo + n). Bounds-
+// checked against the frame. No UDP checksum check: the Ethernet FCS has
+// already been verified by the MAC, which is what lwIP would rely on too for
+// a link-local audio flow.
+static inline bool is_audio_frame(const uint8_t *f, uint32_t len, uint16_t lo, uint16_t n,
+                                  uint32_t *sip_be, uint16_t *sport, uint16_t *dport,
+                                  const uint8_t **payload, uint32_t *plen)
+{
+    if (len < 14 + 20 + 8) return false;
+    if (f[12] != 0x08 || f[13] != 0x00) return false;     // IPv4
+    const uint8_t *ip = f + 14;
+    if ((ip[0] >> 4) != 4 || ip[9] != 17) return false;   // v4, UDP
+    if ((dw_rd16(ip + 6) & 0x3FFF) != 0) return false;    // MF or fragment offset
+    uint32_t ihl = (ip[0] & 0x0F) * 4;
+    const uint8_t *udp = ip + ihl;
+    if (udp + 8 > f + len) return false;
+    uint16_t dp = dw_rd16(udp + 2);
+    if ((uint16_t)(dp - lo) >= n) return false;
+    uint32_t ulen = dw_rd16(udp + 4);
+    if (ulen < 8 || udp + ulen > f + len) return false;
+    memcpy(sip_be, ip + 12, 4);
+    *sport   = dw_rd16(udp);
+    *dport   = dp;
+    *payload = udp + 8;
+    *plen    = ulen - 8;
+    return true;
+}
+
 static esp_err_t stack_input_info(esp_eth_handle_t eth, uint8_t *buffer,
                                   uint32_t length, void *priv, void *info)
 {
     (void)eth;
     s_rx_frames++;
+    if (s_audio_cb) {
+        uint32_t sip; uint16_t sp, dp; const uint8_t *pl; uint32_t pn;
+        if (is_audio_frame(buffer, length, AOIP_RX_AUDIO_PORT, AP_MAX_FLOWS,
+                           &sip, &sp, &dp, &pl, &pn) &&
+            s_audio_cb(sip, sp, dp, pl, pn)) {
+            free(buffer);                        // consumed: lwIP never sees it
+            return ESP_OK;
+        }
+    }
     const uint8_t *payload; uint32_t plen; uint16_t dport;
     if (s_ptp_cb && is_ptpv1_frame(buffer, length, &payload, &plen, &dport)) {
         eth_ts_ptp_frame_t f;
@@ -434,6 +477,7 @@ bool eth_ts_link_up(void)    { return s_link_up; }
 const uint8_t *eth_ts_mac(void) { return s_our_mac; }
 esp_netif_t *eth_ts_netif(void) { return s_netif; }
 void eth_ts_register_ptp_cb(eth_ts_ptp_cb_t cb) { s_ptp_cb = cb; }
+void eth_ts_register_audio_cb(eth_ts_audio_cb_t cb) { s_audio_cb = cb; }
 
 // ---------------------------------------------------------------------------
 // PTP clock

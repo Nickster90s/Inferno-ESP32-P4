@@ -22,9 +22,16 @@ typedef struct {
     uint32_t ka_failed;         // ... that sendto() refused
     int32_t  ka_last_errno;
     int32_t  lat_max_samples;   // max (now - timestamp) since boot
+    uint32_t fast_packets;      // decoded in the EMAC task (stage 2 fast path)
 } aoip_rx_stats_t;
 
 esp_err_t aoip_rx_start(void);
+
+// FAST PATH (default on): audio decoded in the EMAC receive task, bypassing
+// lwIP and the socket. Off = the socket path, for A/B comparison on the bench
+// (telemetry port 7779, "X0" / "X1").
+void aoip_rx_set_fast_path(bool on);
+bool aoip_rx_fast_path(void);
 
 // Bind a flow to a socket. `slot_to_ch` maps each wire slot to a local DAC
 // channel, or -1 to discard it.
@@ -49,6 +56,10 @@ uint32_t aoip_rx_flow_packets(uint8_t idx);
 // Flow idx's highest (now - packet timestamp) in samples since the last call,
 // then reset -- the per-flow latency the heartbeat reports. 0 if inactive.
 uint32_t aoip_rx_take_latency(uint8_t idx);
+
+// Flow idx's packets missed since it was bound (never arrived, or too late
+// to play): cumulative, the heartbeat's 0x8004 word. 0 if inactive.
+uint32_t aoip_rx_flow_missed(uint8_t idx);
 
 // Per-channel peak since the last call (24-bit full scale 2^23), for the
 // heartbeat's meters -- separate from aoip_rx_take_peaks (telemetry).
