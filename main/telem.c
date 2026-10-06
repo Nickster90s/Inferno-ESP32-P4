@@ -245,7 +245,12 @@ static void telem_task(void *arg)
         char q[8];
         int qn = recvfrom(stats, q, sizeof(q), MSG_DONTWAIT,
                           (struct sockaddr *)&from, &flen);
-        if (qn > 0 && q[0] == 'X') {
+        if (qn > 0 && q[0] == 'G') {
+            q[qn < (int)sizeof(q) ? qn : (int)sizeof(q) - 1] = 0;
+            if (qn > 1) jb_set_gain_db(atoi(q + 1));
+            int len = snprintf(txt, sizeof(txt), "output gain %d dB\n", jb_get_gain_db());
+            sendto(stats, txt, (size_t)len, 0, (struct sockaddr *)&from, flen);
+        } else if (qn > 0 && q[0] == 'X') {
             aoip_rx_set_fast_path(qn > 1 && q[1] == '1');
             int len = snprintf(txt, sizeof(txt), "fast path %d\n", (int)aoip_rx_fast_path());
             sendto(stats, txt, (size_t)len, 0, (struct sockaddr *)&from, flen);

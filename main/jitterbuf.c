@@ -34,8 +34,51 @@ static uint64_t s_rx_head;
 static jb_stats_t s_st;
 static uint32_t s_isr_max_us;
 
+// ---------------------------------------------------------------------------
+// OUTPUT GAIN. The PCM1690 is already at 0 dB (its attenuators only cut), and
+// the breakout takes VOUT+ alone -- half the differential swing. Digital gain
+// is the remaining lever: Q16, applied as packets are written, saturating so
+// a hot source clips instead of wrapping. 0..+12 dB, kept in NVS.
+// ---------------------------------------------------------------------------
+#include <math.h>
+#include "nvs.h"
+static volatile uint32_t s_gain_q16 = 65536;
+static int s_gain_db;
+
+static void gain_apply(int db)
+{
+    if (db < 0) db = 0;
+    if (db > 12) db = 12;
+    s_gain_db = db;
+    s_gain_q16 = (uint32_t)lroundf(65536.0f * powf(10.0f, db / 20.0f));
+}
+
+void jb_set_gain_db(int db)
+{
+    gain_apply(db);
+    nvs_handle_t h;
+    if (nvs_open("out", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "gain_db", s_gain_db);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+int jb_get_gain_db(void) { return s_gain_db; }
+
+static void gain_load(void)
+{
+    nvs_handle_t h; int32_t v = 0;
+    if (nvs_open("out", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i32(h, "gain_db", &v);
+        nvs_close(h);
+    }
+    gain_apply((int)v);
+}
+
 void jb_init(void)
 {
+    gain_load();
     memset(&s_st, 0, sizeof(s_st));
     s_rx_head = 0;
 }
@@ -187,6 +230,7 @@ bool jb_write(uint64_t first_idx, uint32_t nframes,
         return false;
     }
 
+    const uint32_t gain = s_gain_q16;
     const uint8_t *src = be24;
     int32_t *seg = NULL; size_t seg_n = 0;       // contiguous run to write back
     for (uint32_t f = 0; f < nframes; f++, src += nslots * 3) {
@@ -204,10 +248,16 @@ bool jb_write(uint64_t first_idx, uint32_t nframes,
             if (ch >= 0 && ch < AP_NCH) {
                 // AoIP is 24-bit big-endian MSB-justified; shifting it up by 8
                 // yields exactly the 32-bit MSB-justified word the I2S slot
-                // wants. No scaling step, deliberately.
-                row[ch] = (int32_t)(((uint32_t)p[0] << 24) |
-                                    ((uint32_t)p[1] << 16) |
-                                    ((uint32_t)p[2] << 8));
+                // wants. At 0 dB that is all there is to it.
+                int32_t v = (int32_t)(((uint32_t)p[0] << 24) |
+                                      ((uint32_t)p[1] << 16) |
+                                      ((uint32_t)p[2] << 8));
+                if (gain != 65536) {
+                    // Output gain, saturating: clip at full scale, never wrap.
+                    int64_t g = ((int64_t)v * gain) >> 16;
+                    v = g > INT32_MAX ? INT32_MAX : g < INT32_MIN ? INT32_MIN : (int32_t)g;
+                }
+                row[ch] = v;
             }
         }
     }

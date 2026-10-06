@@ -29,12 +29,17 @@
 #define KP_ACQ_NUM      500         // /KP_DEN
 #define KP_ACQ_FAST_NUM 700
 #define KI_ACQ_NUM      40000       // /KI_DEN, per Sync
-// More in a row than this is movement, not a spike. 8 Syncs = 2 s: long
-// enough to ride through the ~0.75 s transient seen whenever an audio flow
-// starts (four Syncs reading ~35 us early; cause not yet identified), short
-// enough that a genuine shift is acted on within 2 s.
-#define OUTLIER_RUN_MAX 8
-#define SHIFT_N         4           // consecutive agreeing outliers = a real phase shift
+// More in a row than this is movement, not a spike: 40 Syncs = 10 s.
+// A phase shift needs PS_SHIFT_N (ptp_servo.h) agreeing ones = 6 s.
+//
+// Both used to be far shorter (2 s / 1 s, sized for the ~0.75 s transient at a
+// flow start). On the bench the Leader's offset then jumped +15..21 us every
+// ~90 s for 2-5 s and came back by itself. Each jump was "corrected" as a
+// phase shift, the clock was then that far off the other way when it ended,
+// and the re-convergence dropped lock: Sync red in the controller many times
+// a day. A real shift persists and is still corrected, 6 s later.
+#define OUTLIER_RUN_MAX 40
+#define SHIFT_N         PS_SHIFT_N
 #define SHIFT_SPREAD_NS 5000        // ... agreeing within this
 
 void ptp_servo_init(ptp_servo_t *s, uint8_t median_n)

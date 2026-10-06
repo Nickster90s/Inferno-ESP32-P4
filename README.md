@@ -285,6 +285,16 @@ offset jitter. With lock < 2 µs and unlock after 4 Syncs > 5 µs, the bench
 flapped while the offset sat at 1.5–1.9 µs. Now lock < 3 µs (8 in a row),
 unlock after 8 in a row > 10 µs: over 3 minutes, unlocked once (at boot).
 
+### Transient offset jumps
+
+On the bench the Leader's offset jumps +15..21 µs every ~90 s for 2–5 s and
+comes back by itself (source on the network unknown). With 4 agreeing outliers
+(1 s) taken as a phase shift and 8 (2 s) as movement, each jump was
+"corrected", the clock was then that far off the other way, and lock dropped:
+Sync red in the controller many times a day. The servo now holds the rate
+through up to 40 outliers (10 s) and needs 24 agreeing ones (6 s) for a phase
+shift. Ten minutes before / after: 5 / 0 lock drops, 5 / 0 false shifts.
+
 ### Outliers and phase shifts (the old "71 s step")
 
 When an audio flow starts, the Leader-to-us delay drops by **~36 µs and stays

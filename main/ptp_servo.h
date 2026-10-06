@@ -27,6 +27,7 @@
 #define PS_UNLOCK_NS        10000
 #define PS_LOCK_STREAK      8
 #define PS_UNLOCK_STREAK    8
+#define PS_SHIFT_N          24          // agreeing outliers (6 s) = a real phase shift
 #define PS_STEP_NS          1000000LL   // 1 ms, per statime's step_threshold
 
 typedef struct {
@@ -44,7 +45,7 @@ typedef struct {
     uint8_t  median_pos, median_count;
     uint8_t  lock_streak, unlock_streak;
     uint8_t  outlier_run;      // consecutive rejected samples
-    int64_t  orun[4];          // the first SHIFT_N of them
+    int64_t  orun[PS_SHIFT_N]; // the first PS_SHIFT_N of them
     uint32_t shifts;           // phase shifts corrected by a small step
 
     // Frequency pre-estimate (see ptp_servo.c). Before steering, measure how

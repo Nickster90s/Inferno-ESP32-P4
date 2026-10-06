@@ -75,6 +75,10 @@ void     jb_step_playout(int64_t delta_frames);
 void jb_peek_peaks(uint32_t peaks[AP_NCH]);
 
 void jb_get_stats(jb_stats_t *out);
+
+// Output gain, 0..+12 dB, saturating; stored in NVS (telemetry "G<dB>").
+void jb_set_gain_db(int db);
+int  jb_get_gain_db(void);
 uint32_t jb_take_isr_max_us(void);       // longest TX interrupt since last call
 
 #endif // JITTERBUF_H
