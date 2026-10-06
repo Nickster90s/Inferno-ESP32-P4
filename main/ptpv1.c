@@ -147,11 +147,12 @@ static void apply_servo(int64_t offset_ns)
     if (s_servo.locked && !was_locked)
         ESP_LOGI(TAG, "LOCKED  offset %lld ns  rate %d ppb", (long long)offset_ns,
                  (int)s_servo.rate_ppb);
-    if (!s_servo.locked && was_locked) ESP_LOGW(TAG, "lock lost");
+    if (!s_servo.locked && was_locked) { ESP_LOGW(TAG, "lock lost"); g_ptpv1.lock_losses++; }
     was_est = s_servo.est_done; was_locked = s_servo.locked;
 
     g_ptpv1.locked        = s_servo.locked;
     g_ptpv1.offset_ns     = s_servo.offset_ns;
+    g_ptpv1.filtered_ns   = s_servo.filtered_ns;
     g_ptpv1.rate_ppb      = s_servo.rate_ppb;
     g_ptpv1.servo_updates = s_servo.updates;
 

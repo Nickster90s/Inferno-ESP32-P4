@@ -87,7 +87,7 @@ static int build_stats(char *out, size_t cap)
         "rate_pin=%d\n"
         "rate_pinned=%d\n"
         "rate_fpp=%u\n"
-        "ptp_locked=%d\n"
+        "ptp_locked=%d\nptp_lock_losses=%u\n"
         "ptp_have_master=%d\n"
         "ptp_offset_ns=%lld\n"
         "ptp_path_delay_ns=%lld\n"
@@ -148,7 +148,7 @@ static int build_stats(char *out, size_t cap)
         (unsigned)eth_ts_rx_kicks(), (unsigned)eth_ts_rx_restarts(), (unsigned)eth_ts_fifo_hang_reboots(), (unsigned)jb.isr_gaps, (unsigned)eth_ts_phy_resets(),
         (unsigned)rate_hz(), rate_pin_level(), (int)rate_is_pinned(),
         (unsigned)rate_get()->fpp,
-        g_ptpv1.locked, g_ptpv1.have_master,
+        g_ptpv1.locked, (unsigned)g_ptpv1.lock_losses, g_ptpv1.have_master,
         (long long)g_ptpv1.offset_ns, (long long)g_ptpv1.mean_path_delay_ns,
         (int)g_ptpv1.rate_ppb,
         (unsigned)g_ptpv1.rx_sync, (unsigned)g_ptpv1.rx_followup,

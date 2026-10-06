@@ -20,6 +20,8 @@ typedef struct {
     uint16_t master_port_id;
 
     int64_t  offset_ns;
+    int64_t  filtered_ns;           // after the median, outliers held out: what is REPORTED
+    uint32_t lock_losses;
     int64_t  mean_path_delay_ns;
 
     uint32_t rx_sync, rx_followup, rx_delay_resp, rx_other;

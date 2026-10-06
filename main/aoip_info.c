@@ -126,7 +126,11 @@ static void send_heartbeat(void)
     // 0x8000: clock sync quality -- |offset| and mean path delay, ns. This is
     // what DC's Sync indicator reads. Reported honestly: green is earned by the
     // servo, not by the report.
-    int64_t off = g_ptpv1.offset_ns;  if (off < 0) off = -off;
+    // FILTERED offset while locked, not the last raw Sync: the servo rides
+    // through brief jumps (+15..21 us every ~90 s on the bench) without acting
+    // on them, and reporting them raw still turned the controller's Sync red.
+    int64_t off = g_ptpv1.locked ? g_ptpv1.filtered_ns : g_ptpv1.offset_ns;
+    if (off < 0) off = -off;
     if (off > 0xFFFFFFFFLL) off = 0xFFFFFFFFLL;
     int64_t pd = g_ptpv1.mean_path_delay_ns;  if (pd < 0) pd = 0;
     if (pd > 0xFFFFFFFFLL) pd = 0xFFFFFFFFLL;

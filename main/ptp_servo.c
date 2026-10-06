@@ -29,16 +29,21 @@
 #define KP_ACQ_NUM      500         // /KP_DEN
 #define KP_ACQ_FAST_NUM 700
 #define KI_ACQ_NUM      40000       // /KI_DEN, per Sync
-// More in a row than this is movement, not a spike: 40 Syncs = 10 s.
-// A phase shift needs PS_SHIFT_N (ptp_servo.h) agreeing ones = 6 s.
+// More in a row than this is movement, not a spike: 80 Syncs = 20 s.
+// A phase shift needs PS_SHIFT_N (ptp_servo.h) agreeing ones = 15 s.
 //
 // Both used to be far shorter (2 s / 1 s, sized for the ~0.75 s transient at a
 // flow start). On the bench the Leader's offset then jumped +15..21 us every
 // ~90 s for 2-5 s and came back by itself. Each jump was "corrected" as a
 // phase shift, the clock was then that far off the other way when it ended,
 // and the re-convergence dropped lock: Sync red in the controller many times
-// a day. A real shift persists and is still corrected, 6 s later.
-#define OUTLIER_RUN_MAX 40
+// a day. A real shift persists and is still corrected, 15 s later.
+//
+// The jumps are +9..19 us, every 88-89 s, 4-7 s long (6 s was too short): Syncs
+// arriving LATE by about one 1500-byte frame time on our 100 Mbit link --
+// something on the network floods a burst toward this port and Sync queues
+// behind it.
+#define OUTLIER_RUN_MAX 80
 #define SHIFT_N         PS_SHIFT_N
 #define SHIFT_SPREAD_NS 5000        // ... agreeing within this
 
@@ -161,8 +166,12 @@ int32_t ptp_servo_update(ptp_servo_t *s, int64_t offset_ns, int64_t t_ns,
     //   up to OUTLIER_RUN_MAX scattered ones -> spikes; hold the rate.
     //   more than that, scattered -> real movement; reseed and servo on it.
     if (s->locked && s->median_count >= s->median_n) {
+        // 4 us, not 10: steady-state scatter is ~0.3 us (median |offset|),
+        // and the network jumps (+9..19 us) partly slipped under 10 us, moved
+        // the median, and dragged the clock -- and the offset reported to the
+        // controller -- along with them.
         int64_t d = offset_ns - s->filtered_ns;
-        if (d > 10000 || d < -10000) {
+        if (d > PS_OUTLIER_NS || d < -PS_OUTLIER_NS) {
             if (s->outlier_run < SHIFT_N) s->orun[s->outlier_run] = offset_ns;
             s->outlier_run++;
             s->outliers++;

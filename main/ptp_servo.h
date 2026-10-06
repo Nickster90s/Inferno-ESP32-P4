@@ -27,7 +27,8 @@
 #define PS_UNLOCK_NS        10000
 #define PS_LOCK_STREAK      8
 #define PS_UNLOCK_STREAK    8
-#define PS_SHIFT_N          24          // agreeing outliers (6 s) = a real phase shift
+#define PS_OUTLIER_NS       4000        // |offset - filtered| beyond this = outlier, while locked
+#define PS_SHIFT_N          60          // agreeing outliers (15 s) = a real phase shift
 #define PS_STEP_NS          1000000LL   // 1 ms, per statime's step_threshold
 
 typedef struct {

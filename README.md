@@ -13,20 +13,21 @@ and disciplines its conversion clock to the network.
 
 ## Status: working end to end
 
-Verified on the bench on 2026-09-24, against a RedNet AM2 (PTP leader) and a
-virtual soundcard (DVS) on a Mac as the transmitter:
+Verified on the bench from 2026-09-24 to 2026-10-06, with a RedNet AM2 as PTP
+leader and three transmitters: a virtual soundcard (DVS) on a Mac, Inferno on
+Linux, and the FPGA N-Series transmitter:
 
 | | |
 |---|---|
 | discovery | appears in AoIP Controller with name, model, IP, 8 RX channels |
-| clock | PTPv1 locked, Sync **green about 15 s after power-on** |
+| clock | PTPv1 locked, Sync **green about 20 s after power-on**; no lock drops over 10 min with offset jumps on the network |
 | subscription | patch goes **green**; restored from flash after a reboot; re-established when the transmitter reboots onto a new link-local address |
 | meters | per-channel signal levels shown in the controller |
 | patching | adding or removing a channel causes **0 underruns** on channels already playing |
-| audio | DVS → P4 → PCM1690 → jack, heard on J5 |
+| audio | DVS, Inferno and an FPGA transmitter → P4 → PCM1690 → jack; output gain 0 to +12 dB |
 | sample rate | 48 / 96 kHz selected in the controller; 96 kHz: 0 I2S underruns, 0 playout steps over 5 min |
 | latency | device setting 2 ms (no "custom" warning); receive flow and measured latency reported; the DMA plays the ring, clean down to 1.75 ms from a DVS |
-| long run | see [Measured](#measured); a soak test after the transmit fix below is in progress |
+| long run | see [Measured](#measured); transmit survives past the old ~68 min failure (seen up for 1.8 h) |
 
 Open issues are listed under [Known issues](#known-issues).
 
@@ -117,30 +118,34 @@ Subscriptions are stored in NVS and come back on their own after a reboot.
 ## Architecture
 
 ```
- network                  ESP32-P4                                     PCM1690
- --------  +------------------- core 1 -------------------+
- mDNS      |  mDNS · ARC 4440 · CMC 8800 · info 8700      |
- ARC/CMC ->|  info multicast + 1 Hz heartbeat · telemetry |
- info      |  subscriber: resolve -> flow request         |
-           +----------------------+-----------------------+
-                                  | binds flows
- audio     +------------------- core 0 -------------------+
- 4321+  -->|  aoip_rx --> jitterbuf --> audio_out ---------|-- TDM8 --> 8 ch
-           |  (UDP, keepalive)   (timestamp-    (blocking |   BCK = SCKI
- PTPv1  -->|  ptpv1 (HW stamps)   indexed)   I2S write)   |   12.288 MHz
- 319/320   |        |                ^            |       |
-           |        +-- rate ff --> mclk <--------+       |
-           +--------------------------|-------------------+
-                                APLL trim (sigma-delta)
+ network                  ESP32-P4                                      PCM1690
+ --------  +------------------- core 1 --------------------+
+ mDNS      |  mDNS · ARC 4440 · CMC 8800 · info 8700       |
+ ARC/CMC ->|  info multicast + 1 Hz heartbeat · telemetry  |
+ info      |  subscriber: resolve -> flow request          |
+           +-----------------------+-----------------------+
+                                   | binds flows
+           +------------------- core 0 --------------------+
+ audio     |  emac_rx: frame to a flow port is decoded     |
+ 14336+ -->|  here (aoip_rx) straight into the ring  ------+--> ring = the I2S
+           |                                               |   DMA buffers,
+ PTPv1  -->|  ptpv1 (HW stamps) -> servo -> rate ff        |   played in a loop
+ 319/320   |        mclk (10 Hz) <-- DMA position (TX ISR) |   -- TDM8 --> 8 ch
+           +------------------------|----------------------+   BCK = SCKI
+                              APLL trim (sigma-delta)
 ```
 
 Three properties hold the design together:
 
-- **The CPU is not in the per-sample path; DMA is.** The audio task blocks in
-  `i2s_channel_write()`, and that block *is* the pacing.
-- **Core 0 is audio and PTP only.** Control-plane parsing never delays a DMA block.
+- **The DMA plays the jitter buffer.** The ring *is* the I2S driver's DMA
+  buffers, walked in a closed loop; packets are written straight to the slot
+  where they play. No task copies audio, so nothing has a per-block deadline
+  ([details](#the-dma-plays-the-jitter-buffer)).
+- **Audio is decoded where it arrives.** A frame to a flow port is decoded in
+  the EMAC receive task and never reaches lwIP or a socket
+  ([details](#audio-decoded-in-the-emac-receive-task)).
 - **One controller per buffer.** The media clock's phase loop is the only thing
-  that acts on the buffer. The feed-forward term (below) is a rate, taken from
+  that acts on playout. The feed-forward term (below) is a rate, taken from
   the PTP servo, and never looks at the buffer.
 
 ### Transmit: one descriptor ring, two cores
@@ -239,8 +244,8 @@ The trim is **feed-forward plus phase**:
   rate the PTP servo settles on *is* the crystal error (+41 ppm on this board).
   It is applied directly once PTP locks.
 - **Phase loop**: a slewed PI on playout phase error. It is **off by default**
-  (console `a 1` arms it). Disarmed, playout is rate-matched but carries a
-  constant phase offset from where it was anchored.
+  (console `a 1` arms it). Disarmed, playout is rate-matched; with the DMA
+  playing the ring the phase error stays at 0–5 frames.
 
 ## PTP
 
@@ -287,13 +292,26 @@ unlock after 8 in a row > 10 µs: over 3 minutes, unlocked once (at boot).
 
 ### Transient offset jumps
 
-On the bench the Leader's offset jumps +15..21 µs every ~90 s for 2–5 s and
-comes back by itself (source on the network unknown). With 4 agreeing outliers
-(1 s) taken as a phase shift and 8 (2 s) as movement, each jump was
-"corrected", the clock was then that far off the other way, and lock dropped:
-Sync red in the controller many times a day. The servo now holds the rate
-through up to 40 outliers (10 s) and needs 24 agreeing ones (6 s) for a phase
-shift. Ten minutes before / after: 5 / 0 lock drops, 5 / 0 false shifts.
+On the bench the Leader's Syncs arrive **late by +9..19 µs every 88–89 s, for
+4–7 s**, then return by themselves; the path delay barely moves. 15 µs is one
+1500-byte frame on the board's 100 Mbit link: something on the network floods
+a burst toward this port and Sync queues behind it (source not identified).
+
+The servo used to "correct" each jump as a phase shift (4 agreeing outliers,
+1 s), then sat that far off the other way when it ended, and dropped lock:
+Sync red in the controller many times a day. Now, while locked:
+
+- an offset more than **4 µs** from the filtered value is an outlier (was 10 µs;
+  steady-state scatter is ~0.3 µs, and jumps under 10 µs used to drag the
+  median and the clock with them);
+- the rate is held through up to **80 outliers (20 s)**;
+- a phase shift needs **60 agreeing ones (15 s)**: a real shift, such as the
+  one at a flow start, is still corrected, 15 s later;
+- the heartbeat reports the **filtered** offset, not the last raw Sync.
+
+10 minutes of steady running with the jumps present: raw offset up to 20 µs,
+offset reported to the controller at most 2.5 µs, 0 lock losses, 0 shifts
+(before: 5 lock drops and 5 false shifts in 10 minutes).
 
 ### Outliers and phase shifts (the old "71 s step")
 
@@ -552,6 +570,7 @@ The fields that matter most:
 | `ptp_locked`, `ptp_offset_ns`, `ptp_path_delay_ns` | PTP state |
 | `ptp_rate_ppb` | servo integral, i.e. the crystal error |
 | `ptp_steps`, `ptp_no_hw_ts`, `ptp_path_rejected` | should stay flat after boot |
+| `ptp_lock_losses` | times lock was lost since boot |
 | `ptp_phase_shifts` | small phase corrections while locked (one per flow start is normal) |
 | `mclk_ppb_ff` | feed-forward applied to the APLL |
 | `mclk_error_frames`, `mclk_reset_steps` | playout phase; steps are audible |
@@ -590,6 +609,26 @@ reset**; send `s`, read, and close again rather than leaving it open.
 Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
 `r` re-anchor, `n <name>` rename, `k` refresh subscriptions, `m 0/1` mute.
 
+## Control over UDP
+
+Settings and bench tools on **UDP 7779**: one command per datagram, plain
+ASCII **without a trailing newline** (`echo -n`), one reply back.
+
+| command | effect | saved |
+|---|---|---|
+| `G<dB>` | output gain 0..12 dB, saturating; `G` alone reads it | yes (NVS) |
+| `F<us>` / `F0` | force the playout latency (down to the minimum) / off | no |
+| `X1` / `X0` | audio decoded in the EMAC task (default) / through lwIP | no |
+| `?` | status, `key=value` lines | |
+| `L` | recent non-routine controller requests, hex | |
+
+```bash
+echo -n G6 | nc -u -w1 169.254.3.29 7779      # +6 dB
+```
+
+Sample rate, latency, subscriptions and names are set in AoIP Controller and
+stored on the device.
+
 ## Files
 
 | file | role |
@@ -615,29 +654,25 @@ Console (`?` for help): `s` status, `a 0/1` phase loop, `l <us>` latency,
 
 ## Known issues
 
-1. **Long-run confirmation of the transmit fix is pending.** Before the fix the
-   board lost all transmit after ~68 minutes; a 90-minute soak is running.
-2. **Sync can blink red for ~5 s after a phase-shift correction** (seen at 35 s
-   and 201 s after boot). The audio is unaffected, since the DAC clock follows
-   the rate, not the offset. Likely the re-measured path delay moving the
-   offset past the 5 µs unlock threshold; not yet fixed.
-3. **The ~36 µs shift in path delay when a flow starts is unexplained.** The
-   servo now absorbs it. A side effect: PTPv1 assumes a symmetric path, so if
+1. **The ~36 µs shift in path delay when a flow starts is unexplained.** The
+   servo absorbs it. A side effect: PTPv1 assumes a symmetric path, so if
    the change is only in the Leader-to-us direction, our clock sits a
    constant ~18 µs off the Leader. That is harmless for playout, but it is a
    real offset against other devices.
-4. **The phase loop is disarmed by default**, so playout sits a constant few
-   milliseconds away from the target latency.
-5. **Flow drops under heavy console logging.** Each log line blocks a core-0
-   task for ~10 ms of UART time. With per-sample PTP tracing on, the flow was
-   lost six times in two minutes, so tracing is compiled out
-   (`AP_PTP_TRACE=0`). Use the telemetry stream (UDP 7778) for per-sample
-   data: it does not block.
-6. **Sub-millisecond latency is untested**: the receiver's minimum is now
-   0.75 ms at 96 kHz, but the software transmitters on the bench cannot go
-   that low. The macOS DVS is clean to 1.75 ms; Inferno on Linux sends
-   packets 1.6–1.9 ms after their timestamp (occasionally 4 ms) and is clean
-   at 2 ms.
+2. **Something on the network delays the Leader's Syncs by +9..19 µs every
+   ~89 s for 4–7 s.** The servo ignores it (see
+   [Transient offset jumps](#transient-offset-jumps)); the source is not
+   identified and other devices may be affected.
+3. **The controller's Latency tab is not confirmed working.** The board sends
+   the flow list (ARC 0x3200), per-flow latency (0x8003) and missed packets
+   (0x8004) in the AM2's layout; the tab itself has not been seen to show them.
+4. **Flow drops under heavy console logging.** Each log line blocks a core-0
+   task for ~10 ms of UART time, so per-sample PTP tracing is compiled out
+   (`AP_PTP_TRACE=0`). Use the telemetry stream (UDP 7778) instead.
+5. **Sub-millisecond latency is untested.** The receiver's minimum is 0.75 ms
+   at 96 kHz, but no transmitter on the bench can go that low: the macOS DVS
+   is clean to 1.75 ms; Inferno on Linux stalls ~3 ms every 20–40 s; the FPGA
+   transmitter's timestamps run ~3 ms behind PTP while it advertises 1 ms.
 
 ## Lessons carried across
 
