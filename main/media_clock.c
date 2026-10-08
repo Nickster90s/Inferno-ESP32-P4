@@ -200,12 +200,19 @@ void mclk_tick(void)
         return;
     }
 
-    g_mclk.integral += err;
-    if (g_mclk.integral >  1000000) g_mclk.integral =  1000000;
-    if (g_mclk.integral < -1000000) g_mclk.integral = -1000000;
-
+    // ANTI-WINDUP: integrate only while the output is inside the clamp. A
+    // large error (seconds of drift, or arming late) would otherwise wind the
+    // integral up while the clamp walks the phase back, then overshoot by as
+    // much again.
     int64_t ppb = (int64_t)err * AP_MCLK_KP_NUM
                 + (g_mclk.integral * AP_MCLK_KI_NUM) / 1000;
+    if (ppb < AP_MCLK_PPB_CLAMP && ppb > -AP_MCLK_PPB_CLAMP) {
+        g_mclk.integral += err;
+        if (g_mclk.integral >  1000000) g_mclk.integral =  1000000;
+        if (g_mclk.integral < -1000000) g_mclk.integral = -1000000;
+        ppb = (int64_t)err * AP_MCLK_KP_NUM
+            + (g_mclk.integral * AP_MCLK_KI_NUM) / 1000;
+    }
 
     if (ppb >  AP_MCLK_PPB_CLAMP) ppb =  AP_MCLK_PPB_CLAMP;
     if (ppb < -AP_MCLK_PPB_CLAMP) ppb = -AP_MCLK_PPB_CLAMP;

@@ -100,11 +100,11 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_out_start());
     ESP_ERROR_CHECK(aoip_rx_start());
 
-    // Discipline starts DISARMED, exactly as rx_gate did on the FPGA: the
-    // device behaves like an undisciplined one until something asks for more,
-    // so a servo bug cannot be the reason audio never worked at all. Arm it
-    // from the console with 'a' once PTP is locked, or here once you trust it.
-    mclk_arm(false);
+    // Discipline ARMED. It started disarmed for bring-up (as rx_gate did on
+    // the FPGA), but feed-forward alone lets the phase drift: +2 ms in 3.7 h
+    // on the bench, so the configured latency was not the real one. It only
+    // acts once PTP is locked; console 'a 0' disarms it.
+    mclk_arm(true);
 
     // 5. Control plane -- the only part that needs an address.
     wait_for_ip();

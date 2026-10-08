@@ -243,9 +243,11 @@ The trim is **feed-forward plus phase**:
 - **Feed-forward**: the APLL and the PTP clock share one 40 MHz crystal, so the
   rate the PTP servo settles on *is* the crystal error (+41 ppm on this board).
   It is applied directly once PTP locks.
-- **Phase loop**: a slewed PI on playout phase error. It is **off by default**
-  (console `a 1` arms it). Disarmed, playout is rate-matched; with the DMA
-  playing the ring the phase error stays at 0–5 frames.
+- **Phase loop**: a slewed PI on playout phase error, with anti-windup. It is
+  **on by default** (console `a 0` disarms it). Feed-forward alone matches the
+  rate, not the phase: disarmed, playout drifted 196 frames (2 ms) late in
+  3.7 h, so a configured 1 ms was really 3 ms. Armed, the error stays at 0–9
+  frames.
 
 ## PTP
 
@@ -478,7 +480,24 @@ The **Latency tab** needs two things. ARC 0x3200 must list the receive flows
 Connections". The heartbeat's 0x8003 block then carries each flow's measured
 latency in samples: the running maximum of (now − packet timestamp) at
 receipt, taken while PTP is locked (inferno `flows_rx.rs`; FPGA
-`docs/LATENCY.md`). From the DVS at 96 kHz: about 200 samples (~2.1 ms).
+`docs/LATENCY.md`). The heartbeat's 0x8004 block carries each flow's missed
+packets (never arrived, or too late), cumulative. Confirmed in the controller
+on 2026-10-08: from Inferno-DVS on Linux at 96 kHz the tab shows Average
+~0.2 ms, Peak ~0.5 ms, and the Late count.
+
+### 100 Mbit link: bursts from other devices
+
+The ESP32-P4's EMAC runs at 100 Mbit, so it is usually the slowest port on a
+Dante network. Any burst the switch floods to every port (mDNS multicast)
+drains ten times slower here than on a gigabit device, and the audio queues
+behind it. On the bench, every ~96 s a Prodigy refreshed its cache of a Mac's
+channels with one 60-question query; the Mac's Inferno mDNS (searchfire)
+answered with 60 packets in 3 ms. That queued ~2.5 ms in front of the audio:
+Peak 2.6 ms and 4–8 late packets on every refresh at 1 ms latency, while no
+gigabit device noticed. Fixed at the source (osx.N-Series.AoIP `a9a3081`,
+Inferno-DVS patch 0008: one merged answer, 1400-byte packets 1 ms apart). If
+peaks of 2–3 ms come back at a regular interval, look for a sender like
+that; switch QoS that honours DSCP EF (Dante audio) also prevents it.
 
 ### The DMA plays the jitter buffer
 
@@ -663,9 +682,9 @@ stored on the device.
    ~89 s for 4–7 s.** The servo ignores it (see
    [Transient offset jumps](#transient-offset-jumps)); the source is not
    identified and other devices may be affected.
-3. **The controller's Latency tab is not confirmed working.** The board sends
-   the flow list (ARC 0x3200), per-flow latency (0x8003) and missed packets
-   (0x8004) in the AM2's layout; the tab itself has not been seen to show them.
+3. **The 100 Mbit port is the first to suffer from other devices' bursts.**
+   See [100 Mbit link](#100-mbit-link-bursts-from-other-devices). Mitigation
+   is at the sender or in the switch (QoS); the receiver cannot see the queue.
 4. **Flow drops under heavy console logging.** Each log line blocks a core-0
    task for ~10 ms of UART time, so per-sample PTP tracing is compiled out
    (`AP_PTP_TRACE=0`). Use the telemetry stream (UDP 7778) instead.
