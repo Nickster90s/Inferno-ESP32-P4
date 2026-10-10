@@ -285,6 +285,25 @@ silence at the DAC. `main.c` now joins the group once there is an address;
 lwIP answers the switch's queries from then on. Syncs and lock within ~30 s of
 power-on.
 
+**Re-joining after a link loss.** When the link drops (a switch reboot, a
+pulled cable, our own EMAC restart), esp_netif takes the interface down and
+lwIP frees every group membership; nothing joins them again. After a Luminex
+GigaCore firmware update the board got 0 Syncs and its clock ran free, with no
+error anywhere. A task in `main.c` now re-joins any lost group every second.
+Tested by pulling the cable: "IGMP: re-joined 4 group(s)", Syncs back at once.
+
+**The other groups.** Like Dante devices, the board also joins 224.0.0.231
+(info), 224.0.0.233 (heartbeat) and 239.255.255.255. Switches flood
+224.0.0.x anyway, but Luminex Araneo's IGMP tab lists a device under "Dante"
+only with these joins.
+
+**Only 8 filter slots.** Every add takes a slot, including lwIP's joins and
+duplicates; a 9th fails. `main.c` adds only 224.0.0.1 and mDNS 224.0.0.251
+before there is an address. Keep mDNS there: until the PTP join it is the only
+traffic a snooping switch sends, and without it the RX watchdog took the
+silence for a hung RX and restarted the EMAC until the board never got an
+address.
+
 ### Lock hysteresis
 
 PTPv1 has no correction field, so switch queueing shows up as microseconds of

@@ -33,6 +33,8 @@
 
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
+#include "lwip/igmp.h"
+#include "lwip/netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -55,6 +57,45 @@ static void wait_for_ip(void)
     ESP_LOGW(TAG, "no address yet -- continuing; link-local should appear");
 }
 
+// IGMP KEEPER. A link loss (a switch reboot, a cable, our own EMAC restart)
+// makes esp_netif take the interface down, and lwIP's igmp_stop() then FREES
+// every group membership; nothing joins them again when the link returns. The
+// sockets still think they are members, so no error shows -- but the switch
+// hears no reports, stops forwarding the PTP group, and the media clock runs
+// free (bench, 2026-10-10: Luminex firmware update, 0 Syncs afterwards, DAC8
+// missing from Araneo's IGMP tab). This puts back any group lwIP lost.
+static const uint32_t s_groups[] = {
+    PTP1_GROUP_IP,   // 224.0.1.129 PTP primary
+    0xE00000E7,      // 224.0.0.231 AoIP info
+    0xE00000E9,      // 224.0.0.233 AoIP heartbeat
+    0xEFFFFFFF,      // 239.255.255.255 (what Araneo files "Dante" under)
+};
+
+static esp_err_t igmp_rejoin_cb(void *ctx)
+{
+    int *rejoined = ctx;
+    struct netif *n = netif_default;
+    if (!n || !netif_is_up(n) || !netif_is_link_up(n) ||
+        ip4_addr_isany_val(*netif_ip4_addr(n))) return ESP_OK;
+    for (size_t i = 0; i < sizeof(s_groups) / sizeof(s_groups[0]); i++) {
+        ip4_addr_t a = { .addr = htonl(s_groups[i]) };
+        if (!igmp_lookfor_group(n, &a) && igmp_joingroup_netif(n, &a) == ERR_OK)
+            (*rejoined)++;
+    }
+    return ESP_OK;
+}
+
+static void igmp_keeper_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        int rejoined = 0;
+        esp_netif_tcpip_exec(igmp_rejoin_cb, &rejoined);
+        if (rejoined) ESP_LOGW(TAG, "IGMP: re-joined %d group(s) lost with the link", rejoined);
+    }
+}
+
 void app_main(void)
 {
     // FIRST, before any clock or peripheral is configured: which rate are
@@ -75,11 +116,19 @@ void app_main(void)
     // gives it to us for free. The 224.0.0.0/24 entries are not optional --
     // dropping IGMP queries breaks nothing immediately and then the switch
     // quietly stops forwarding our groups.
+    //
+    // The EMAC has 8 filter slots and every add takes one, duplicate or not;
+    // a 9th fails (logged, harmless for a group nobody reads). Here only what
+    // is needed BEFORE there is an address: 224.0.0.1 and 224.0.0.251. mDNS
+    // must stay: until the PTP join (which needs an address) it is the only
+    // traffic a snooping switch sends us, and without it the RX watchdog took
+    // the silence for a dead RX and restarted the EMAC over and over -- the
+    // board never got an address (bench, 2026-10-10). The PTP group is added
+    // by ptpv1_start(); lwIP's joins add the rest: 224.0.0.1 (its own), PTP,
+    // mDNS, and aoip_info's 224.0.0.231, .233 and 239.255.255.255 -- the
+    // last one is the 9th and gets no slot, which it does not need.
     eth_ts_mcast_allow(0xE0000001);   // 224.0.0.1   all-hosts / IGMP
     eth_ts_mcast_allow(0xE00000FB);   // 224.0.0.251 mDNS
-    eth_ts_mcast_allow(0xE00000E7);   // 224.0.0.231 AoIP info
-    eth_ts_mcast_allow(0xE00000E9);   // 224.0.0.233 AoIP heartbeat
-    eth_ts_mcast_allow(PTP1_GROUP_IP);
 
     // NO IP WAIT HERE. Nothing until the control plane needs an address:
     // PTP Sync reception, stepping and the frequency estimate run on link
@@ -132,6 +181,7 @@ void app_main(void)
     ESP_ERROR_CHECK(aoip_arc_start());
     ESP_ERROR_CHECK(subscriber_start());
     ESP_ERROR_CHECK(console_start());
+    xTaskCreate(igmp_keeper_task, "igmp_keep", 3072, NULL, 2, NULL);
 
     ESP_LOGI(TAG, "up: %d channels, %s, %d-bit, fpp %u, latency %u us",
              AP_NCH, rate_get()->label, AP_BITS_PER_SAMPLE,

@@ -611,9 +611,20 @@ esp_err_t aoip_info_start(void)
     uint8_t ttl = 1;
     setsockopt(s_sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
-    // 224.0.0.231 / .233 are already in the EMAC filter from main.c. Do NOT add
-    // them again: the filter has few slots, and duplicates filled it so that
-    // lwIP's own IGMP join failed ("failed to add MAC filter") on first bench.
+    // IGMP JOINS as Dante devices make them: the groups we announce on, and
+    // 239.255.255.255, the group Luminex Araneo's IGMP tab files a device
+    // under "Dante" by (it showed us as not on Dante without it). Switches
+    // flood 224.0.0.x regardless; 239.255.255.255 carried ~8 kbit/s on the
+    // bench. The joins also add the EMAC filter entries -- see main.c on the
+    // 8 slots.
+    static const uint8_t GRP_DANTE[4] = {239, 255, 255, 255};
+    const uint8_t *groups[] = { GRP_DEVINFO, GRP_HEARTBEAT, GRP_DANTE };
+    for (int i = 0; i < 3; i++) {
+        struct ip_mreq mr = { .imr_interface.s_addr = htonl(INADDR_ANY) };
+        memcpy(&mr.imr_multiaddr.s_addr, groups[i], 4);
+        if (setsockopt(s_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr)) != 0)
+            ESP_LOGW(TAG, "IGMP join of %u.%u.%u.%u failed", groups[i][0], groups[i][1], groups[i][2], groups[i][3]);
+    }
 
     xTaskCreatePinnedToCore(cmc_task, "cmc", 3072, NULL,
                             AP_PRIO_CONTROL, NULL, AP_CORE_CONTROL);
