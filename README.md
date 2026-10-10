@@ -289,8 +289,18 @@ power-on.
 pulled cable, our own EMAC restart), esp_netif takes the interface down and
 lwIP frees every group membership; nothing joins them again. After a Luminex
 GigaCore firmware update the board got 0 Syncs and its clock ran free, with no
-error anywhere. A task in `main.c` now re-joins any lost group every second.
-Tested by pulling the cable: "IGMP: re-joined 4 group(s)", Syncs back at once.
+error anywhere. A task in `main.c` now re-joins any lost group every second, and restarts
+mDNS, which stopped too and only comes back on a "got IP" event that a
+link-local address never posts (the board kept playing but was invisible;
+after a lost flow it could not resolve its transmitter either).
+
+What took the interface down was our own RX watchdog, not the cable: a pulled
+cable only drops the link, but the watchdog restarted the EMAC after 4 s
+without frames, assuming PTP always arrives. Right after a re-link nothing
+does until the join. It now restarts only when RX is stuck, not when it is
+quiet: DMA waiting with nothing dropped logs "RX quiet but healthy". Console
+`E` forces the restart; tested: groups and mDNS back after the link-local
+address (~15 s), audio after ~23 s.
 
 **The other groups.** Like Dante devices, the board also joins 224.0.0.231
 (info), 224.0.0.233 (heartbeat) and 239.255.255.255. Switches flood

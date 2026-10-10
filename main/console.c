@@ -36,6 +36,7 @@ static void help(void)
       "  r            re-anchor the playout pointer to PTP now\n"
       "  n <name>     device name (re-advertises mDNS)\n"
       "  k            force a subscription refresh\n"
+      "  E            restart the EMAC (as the RX watchdog does)\n"
       "  m [0|1]      DAC mute\n"
       "  ?            this help\n\n",
       (unsigned)rate_get()->latency_min_us, AP_LATENCY_US_MAX);
@@ -145,6 +146,7 @@ static void console_task(void *arg)
             if (*arg) { aoip_mdns_set_name(arg); printf("name -> %s\n", arg); }
             break;
         case 'k': subscriber_force_refresh(); printf("refreshing\n"); break;
+        case 'E': eth_ts_force_restart(); break;
         case 'm': pcm1690_set_mute(*arg ? (atoi(arg) != 0) : true); break;
         case '\n': case '\r': case 0: break;
         default: printf("? '%c'\n", cmd); break;

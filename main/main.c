@@ -34,6 +34,7 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "lwip/igmp.h"
+#include "mdns.h"
 #include "lwip/netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -63,7 +64,8 @@ static void wait_for_ip(void)
 // sockets still think they are members, so no error shows -- but the switch
 // hears no reports, stops forwarding the PTP group, and the media clock runs
 // free (bench, 2026-10-10: Luminex firmware update, 0 Syncs afterwards, DAC8
-// missing from Araneo's IGMP tab). This puts back any group lwIP lost.
+// missing from Araneo's IGMP tab). This puts back any group lwIP lost, and
+// restarts mDNS, which the link loss stopped as well.
 static const uint32_t s_groups[] = {
     PTP1_GROUP_IP,   // 224.0.1.129 PTP primary
     0xE00000E7,      // 224.0.0.231 AoIP info
@@ -92,7 +94,15 @@ static void igmp_keeper_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(1000));
         int rejoined = 0;
         esp_netif_tcpip_exec(igmp_rejoin_cb, &rejoined);
-        if (rejoined) ESP_LOGW(TAG, "IGMP: re-joined %d group(s) lost with the link", rejoined);
+        if (!rejoined) continue;
+        ESP_LOGW(TAG, "IGMP: re-joined %d group(s) lost with the link", rejoined);
+        // mDNS went down with the link too, and comes back only on a "got
+        // IP" event, which a link-local address never posts: the board kept
+        // playing but answered no query, and the controller dropped it once
+        // its cache ran out (bench, 2026-10-10, after a cable pull).
+        mdns_netif_action(eth_ts_netif(), MDNS_EVENT_DISABLE_IP4);
+        mdns_netif_action(eth_ts_netif(), MDNS_EVENT_ENABLE_IP4 | MDNS_EVENT_ANNOUNCE_IP4);
+        ESP_LOGW(TAG, "mDNS: re-enabled and announced");
     }
 }
 

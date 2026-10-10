@@ -372,11 +372,12 @@ static void rx_watchdog_task(void *arg)
     if (s_fifo_hang_magic != 0x46494630u) { s_fifo_hang_magic = 0x46494630u; s_fifo_hang_reboots = 0; }
     uint32_t last = s_rx_frames;
     int idle_ms = 0;
+    bool quiet = false;
     TaskHandle_t emac_rx = NULL;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(250));
         uint32_t now = s_rx_frames;
-        if (now != last || !s_link_up) { last = now; idle_ms = 0; continue; }
+        if (now != last || !s_link_up) { last = now; idle_ms = 0; quiet = false; continue; }
         idle_ms += 250;
         if (idle_ms == 1000) {
             // What does the MAC see? RX DMA state + frames it had to drop.
@@ -386,6 +387,18 @@ static void rx_watchdog_task(void *arg)
             s_rx_dma_state = st; s_rx_missed += mf; s_rx_fifo_ovf += of;
             ESP_LOGW(TAG, "RX idle 1 s: dma state %u (3 wait, 4 SUSPENDED no-desc), "
                           "missed %u, fifo overflow %u", (unsigned)st, (unsigned)mf, (unsigned)of);
+            // QUIET, NOT STUCK: DMA waiting for a frame and nothing dropped
+            // means nothing arrived. That is normal right after a link comes
+            // back -- no PTP until the join, a switch port still learning --
+            // and an EMAC restart then only made it worse: esp_eth_stop()
+            // takes the netif down, lwIP frees every IGMP group and mDNS
+            // stops, so the board stayed deaf and invisible (bench,
+            // 2026-10-10: audio gone after a cable pull, some pulls only).
+            quiet = (st == 3 && mf == 0 && of == 0);
+        }
+        if (quiet && idle_ms > 2000) {
+            if (idle_ms == 2250) ESP_LOGW(TAG, "RX quiet but healthy (DMA waiting, nothing dropped) -- no restart");
+            continue;
         }
         if (idle_ms == 1000 || idle_ms == 2000) {
             if (!emac_rx) emac_rx = xTaskGetHandle("emac_rx");
@@ -426,6 +439,17 @@ static void rx_watchdog_task(void *arg)
             idle_ms = 0;
         }
     }
+}
+
+// Console 'E': the watchdog's EMAC restart on demand, to test what a real
+// one does to IGMP, mDNS and the flows.
+void eth_ts_force_restart(void)
+{
+    s_rx_restarts++;
+    ESP_LOGE(TAG, "forced EMAC restart (#%u)", (unsigned)s_rx_restarts);
+    esp_eth_stop(s_eth);
+    esp_eth_start(s_eth);
+    rx_hold_not_flush();
 }
 
 uint32_t eth_ts_rx_kicks(void)    { return s_rx_kicks; }
