@@ -248,6 +248,13 @@ The trim is **feed-forward plus phase**:
   rate, not the phase: disarmed, playout drifted 196 frames (2 ms) late in
   3.7 h, so a configured 1 ms was really 3 ms. Armed, the error stays at 0–9
   frames.
+- **Step band**: the loop is clamped at 2000 ppb, which moves playout only
+  0.2 frames/s at 96 kHz. An error beyond half the latency (48 frames at 1 ms)
+  means silence, so playout is stepped once the error has stayed there for
+  0.5 s; beyond 10 ms it steps at once. On the bench, lock losses left playout
+  231 frames early with PTP locked: every packet late, ~20 min of silence
+  before the old 10 ms band. Single-reading jumps (-53 then +55 frames, 0.1 s
+  apart) are logged and ignored; their cause is still open.
 
 ## PTP
 

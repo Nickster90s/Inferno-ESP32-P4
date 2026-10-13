@@ -181,7 +181,31 @@ void mclk_tick(void)
 
     g_mclk.error_frames = (int32_t)err;
 
-    if (err > AP_MCLK_RESET_FRAMES || err < -AP_MCLK_RESET_FRAMES) {
+    // STEP BAND. At most AP_MCLK_RESET_FRAMES (10 ms), but never more than
+    // half the latency: an error that large makes every packet late or every
+    // sample stale, i.e. silence, and the clamped rate loop walks only
+    // 2000 ppb = 0.2 frames/s at 96 kHz. Bench, 2026-10-13: -231 frames at
+    // 1 ms latency (96 frames) after lock losses -- all 12000 packets/s late,
+    // ~20 min of silence ahead. One click is the better deal.
+    int64_t band = AP_MCLK_RESET_FRAMES;
+    if ((int64_t)g_mclk.latency_frames / 2 < band) band = g_mclk.latency_frames / 2;
+    if (band < 32) band = 32;
+    // ...but only once it PERSISTS (0.5 s). A single reading beyond the band
+    // and back is a glitch, not a buffer in the wrong place: the first bench
+    // run stepped -53 then +55 frames 100 ms apart -- two clicks for nothing.
+    // The hard 10 ms limit still steps at once.
+    static int s_out_of_band;
+    bool hard = err > AP_MCLK_RESET_FRAMES || err < -AP_MCLK_RESET_FRAMES;
+    if (err > band || err < -band) {
+        if (++s_out_of_band == 1)
+            ESP_LOGW(TAG, "phase error %lld frames beyond band %lld", (long long)err, (long long)band);
+    } else {
+        if (s_out_of_band) ESP_LOGW(TAG, "phase error back in band after %d tick(s): %lld frames",
+                                    s_out_of_band, (long long)err);
+        s_out_of_band = 0;
+    }
+    if (hard || s_out_of_band >= AP_MCLK_UPDATE_HZ / 2) {
+        s_out_of_band = 0;
         // Beyond anything the rate loop can walk back in reasonable time.
         // Stepping is audible; if this fires in steady state the fault is
         // upstream of the servo, so it is counted and reported, never silent.
