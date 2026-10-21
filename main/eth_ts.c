@@ -1,4 +1,5 @@
 #include "eth_ts.h"
+#include "esp_timer.h"
 #include "app_config.h"
 #include "aoip_wire.h"
 #include "esp_eth.h"
@@ -83,6 +84,13 @@ static bool extract_rx_ts(void *info, eth_ts_time_t *out)
 }
 
 static volatile uint32_t s_rx_frames;      // every frame the EMAC delivered
+uint32_t eth_ts_rx_frames(void) { return s_rx_frames; }
+// DIAGNOSTIC: time in our input hook, and between hooks (the driver's own
+// per-frame work plus anything else core 0 does), in microseconds.
+static volatile uint64_t s_hook_us, s_between_us;
+static int64_t s_hook_end;
+void eth_ts_hook_times(uint64_t *hook_us, uint64_t *between_us)
+{ *hook_us = s_hook_us; *between_us = s_between_us; }
 static uint32_t s_rx_kicks, s_rx_restarts, s_phy_resets;
 static uint32_t s_rx_dma_state, s_rx_missed, s_rx_fifo_ovf;
 
@@ -114,11 +122,23 @@ static inline bool is_audio_frame(const uint8_t *f, uint32_t len, uint16_t lo, u
     return true;
 }
 
+static esp_err_t stack_input_inner(uint8_t *buffer, uint32_t length, void *priv, void *info);
+
 static esp_err_t stack_input_info(esp_eth_handle_t eth, uint8_t *buffer,
                                   uint32_t length, void *priv, void *info)
 {
     (void)eth;
     s_rx_frames++;
+    int64_t t_in = esp_timer_get_time();
+    if (s_hook_end && t_in - s_hook_end < 2000) s_between_us += (uint64_t)(t_in - s_hook_end);
+    esp_err_t r = stack_input_inner(buffer, length, priv, info);
+    s_hook_end = esp_timer_get_time();
+    s_hook_us += (uint64_t)(s_hook_end - t_in);
+    return r;
+}
+
+static esp_err_t stack_input_inner(uint8_t *buffer, uint32_t length, void *priv, void *info)
+{
     if (s_audio_cb) {
         uint32_t sip; uint16_t sp, dp; const uint8_t *pl; uint32_t pn;
         if (is_audio_frame(buffer, length, AOIP_RX_AUDIO_PORT, AP_MAX_FLOWS,
@@ -419,7 +439,7 @@ static void rx_watchdog_task(void *arg)
             ESP_LOGE(TAG, "RX FIFO hang (EMACDEBUG %08x) -- rebooting (#%u)",
                      (unsigned)EMAC_MAC.emacdebug.val, (unsigned)s_fifo_hang_reboots);
             vTaskDelay(pdMS_TO_TICKS(100));
-            esp_restart();
+            eth_ts_reboot();
         } else if (idle_ms == 4000) {
             s_rx_restarts++;
             ESP_LOGE(TAG, "RX still dead -- restarting EMAC (#%u)", (unsigned)s_rx_restarts);
@@ -636,4 +656,34 @@ esp_err_t eth_ts_mcast_allow(uint32_t group_ip)
     ESP_LOGI(TAG, "mcast filter += %02x:%02x:%02x:%02x:%02x:%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return esp_eth_ioctl(s_eth, ETH_CMD_ADD_MAC_FILTER, mac);
+}
+
+// ---------------------------------------------------------------------------
+// REBOOT WITH THE EMAC IDLE. esp_restart() on the P4 resets only the CPUs
+// (rst:0xc SW_CPU_RESET): the EMAC's DMA keeps running and the AXI bus is
+// not reset. Caught in the middle of a transfer -- at 12000 packets/s it
+// always is -- the next boot's RX DMA stayed in "fetching descriptor" (state
+// 1) for good: no frame received, and neither an EMAC restart nor a PHY
+// reset nor esp_eth's own reset at init cleared it; only a power-on reset
+// did (bench 2026-10-16, 2 of 3 restarts from the web page). So: stop both
+// DMA directions, wait until neither is mid-transfer, then reset the whole
+// system, bus included (rst:0x3), as a watchdog would.
+// ---------------------------------------------------------------------------
+#include "hal/emac_ll.h"
+#include "esp_rom_sys.h"
+#include "esp_rom_uart.h"
+void eth_ts_reboot(void)
+{
+    ESP_LOGW(TAG, "reboot: stopping EMAC DMA, then system reset");
+    esp_rom_output_tx_wait_idle(0);
+    emac_ll_receive_enable(&EMAC_MAC, false);
+    emac_ll_transmit_enable(&EMAC_MAC, false);
+    emac_ll_start_stop_dma_receive(&EMAC_DMA, false);
+    emac_ll_start_stop_dma_transmit(&EMAC_DMA, false);
+    for (int i = 0; i < 200; i++) {                 // <= 20 ms
+        if (EMAC_DMA.dmastatus.recv_proc_state == 0 &&
+            EMAC_DMA.dmastatus.trans_proc_state == 0) break;
+        esp_rom_delay_us(100);
+    }
+    esp_rom_software_reset_system();
 }

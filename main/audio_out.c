@@ -150,10 +150,13 @@ esp_err_t audio_out_init(void)
         },
     };
     tdm_cfg.slot_cfg.slot_bit_width = AP_SLOT_BIT_WIDTH;
-    // LRCK: IDF's Philips TDM default, unchanged. That is what the verified
-    // ../stm32 UAC firmware uses on this breakout with FMTDA 1000. (An earlier
-    // edit here flipped ws_pol from a reading of the datasheet figure; the
-    // working reference says the default is right.)
+    // LRCK starts the frame HIGH. The PCM1690's I2S-mode TDM begins the frame
+    // at the LRCK rising edge (one BCK later, the MSB of DAC1); IDF's Philips
+    // default starts it with LRCK low, so the DAC counted from mid-frame and
+    // played slot 1 on VOUT5: measured 2026-10-21, DC ch 1/2 on DAC pins 35/33
+    // (VOUT5+/VOUT6+). The ../stm32 UAC reference "worked" with the default
+    // because nobody checked which jack carried which channel.
+    tdm_cfg.slot_cfg.ws_pol         = true;
     tdm_cfg.slot_cfg.total_slot     = AP_NCH;
 
     // *** IF THIS CALL FAILS, READ THIS BEFORE DEBUGGING ANYTHING ELSE ***

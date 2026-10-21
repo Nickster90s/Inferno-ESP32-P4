@@ -29,6 +29,7 @@
 #include "subscriber.h"
 #include "telem.h"
 #include "console.h"
+#include "web.h"
 #include "aoip_wire.h"
 
 #include "nvs_flash.h"
@@ -191,6 +192,7 @@ void app_main(void)
     ESP_ERROR_CHECK(aoip_arc_start());
     ESP_ERROR_CHECK(subscriber_start());
     ESP_ERROR_CHECK(console_start());
+    if (web_start() != ESP_OK) ESP_LOGW(TAG, "web page did not start");
     xTaskCreate(igmp_keeper_task, "igmp_keep", 3072, NULL, 2, NULL);
 
     ESP_LOGI(TAG, "up: %d channels, %s, %d-bit, fpp %u, latency %u us",

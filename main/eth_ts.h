@@ -56,6 +56,8 @@ esp_err_t eth_ts_start(void);
 
 // Receive watchdog counters (see eth_ts.c).
 uint32_t eth_ts_rx_kicks(void);
+uint32_t eth_ts_rx_frames(void);
+void     eth_ts_hook_times(uint64_t *hook_us, uint64_t *between_us);   // diagnostic           // every frame the EMAC delivered
 uint32_t eth_ts_rx_restarts(void);
 void eth_ts_force_restart(void);
 uint32_t eth_ts_fifo_hang_reboots(void);   // RX FIFO hang -> reboot, across reboots
@@ -64,6 +66,8 @@ uint32_t eth_ts_phy_resets(void);
 void eth_ts_mac_dump(void);
 void eth_ts_rx_diag(uint32_t *dma_state_now, uint32_t *missed, uint32_t *fifo_ovf);
 bool      eth_ts_link_up(void);
+// Every software restart goes through this, never esp_restart(): see eth_ts.c.
+void      eth_ts_reboot(void);
 const uint8_t *eth_ts_mac(void);
 esp_netif_t   *eth_ts_netif(void);
 

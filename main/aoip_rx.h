@@ -23,6 +23,12 @@ typedef struct {
     int32_t  ka_last_errno;
     int32_t  lat_max_samples;   // max (now - timestamp) since boot
     uint32_t fast_packets;      // decoded in the EMAC task (stage 2 fast path)
+    uint32_t ka_gap_max_us;     // longest time between two keepalives sent
+    uint32_t ka_send_max_us;    // longest single sendto()
+    uint32_t ka_gaps_500ms;     // gaps over 500 ms (a Prodigy drops the flow at ~1 s)
+    uint32_t src_other;         // packets from a source other than the latched one
+    uint32_t src_other_ip;      // the last such source (network order)
+    uint16_t src_other_port;    // ... host order
 } aoip_rx_stats_t;
 
 esp_err_t aoip_rx_start(void);

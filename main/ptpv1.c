@@ -214,8 +214,7 @@ static void compute_offset(void)
             // cost another second.
             s_have_t3 = false;
             s_have_ms = false;
-            s_servo.median_count = 0;
-            s_servo.median_pos = 0;
+            ptp_servo_clear_filter(&s_servo);
             g_ptpv1.step_count++;            // media clock re-anchors on this
             ESP_LOGI(TAG, "phase snap %lld ns", (long long)-offset);
         } else {
@@ -223,6 +222,11 @@ static void compute_offset(void)
         }
     } else {
         apply_servo(offset);
+        // Pair the path delay with the FILTERED t2 - t1, not this Sync's: a
+        // Sync queued 10 us behind an audio frame put 5 us into the path
+        // average, which then read 13.2..16.5 us on a path that does not move.
+        if (s_servo.est_done && s_servo.locked)
+            s_last_ms = s_servo.filtered_ns + g_ptpv1.mean_path_delay_ns;
     }
 
     s_have_t1 = s_have_t2 = false;
@@ -403,7 +407,7 @@ esp_err_t ptpv1_start(void)
 {
     memset(&g_ptpv1, 0, sizeof(g_ptpv1));
     memcpy(s_uuid, eth_ts_mac(), 6);
-    ptp_servo_init(&s_servo, 7);
+    ptp_servo_init(&s_servo);
 
     s_q = xQueueCreate(32, sizeof(eth_ts_ptp_frame_t));
     if (!s_q) return ESP_ERR_NO_MEM;

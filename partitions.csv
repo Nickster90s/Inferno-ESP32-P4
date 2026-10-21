@@ -1,4 +1,11 @@
 # Name,   Type, SubType, Offset,  Size, Flags
+# nvs and phy_init stay where they were (0x9000, 0xF000): the settings kept
+# in NVS (rate, latency, names, gain) survive the change to two app slots.
+# Two app slots for the web update (main/web.c): it writes the one that is
+# not running and boots it; the bootloader goes back to the old one if the
+# new one does not mark itself valid (rollback).
 nvs,      data, nvs,     ,        24K,
 phy_init, data, phy,     ,        4K,
-factory,  app,  factory, ,        2M,
+otadata,  data, ota,     ,        8K,
+ota_0,    app,  ota_0,   0x20000, 3M,
+ota_1,    app,  ota_1,   ,        3M,

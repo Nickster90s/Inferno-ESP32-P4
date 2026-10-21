@@ -9,7 +9,7 @@ and disciplines its conversion clock to the network.
 **Board:** Waveshare ESP32-P4-ETH (ESP32-P4, IP101 PHY, 100 Mbit/s, CH343 USB-UART)
 **DAC:** PCM1690 breakout, 24-bit, 8 line outputs on 4 × 3.5 mm jacks
 **Rate:** 48 or 96 kHz, chosen in the controller (see [Sample rates](#sample-rates-48-and-96-khz-chosen-in-the-controller))
-**Toolchain:** ESP-IDF v5.5
+**Toolchain:** ESP-IDF v5.5.6 (`~/esp/esp-idf-v5.5.6`; v5.5.0 cannot build for v3.x chips)
 
 ## Status: working end to end
 
@@ -24,7 +24,8 @@ Linux, and the FPGA N-Series transmitter:
 | subscription | patch goes **green**; restored from flash after a reboot; re-established when the transmitter reboots onto a new link-local address |
 | meters | per-channel signal levels shown in the controller |
 | patching | adding or removing a channel causes **0 underruns** on channels already playing |
-| audio | DVS, Inferno and an FPGA transmitter → P4 → PCM1690 → jack; output gain 0 to +12 dB |
+| audio | DVS, Inferno and an FPGA transmitter → P4 → PCM1690 → jack; output volume −60 to +4 dB and mute |
+| web page | status, volume, firmware update from the update server or a file, back to the previous version ([Web page](#web-page-and-firmware-update)) |
 | sample rate | 48 / 96 kHz selected in the controller; 96 kHz: 0 I2S underruns, 0 playout steps over 5 min |
 | latency | device setting 2 ms (no "custom" warning); receive flow and measured latency reported; the DMA plays the ring, clean down to 1.75 ms from a DVS |
 | long run | see [Measured](#measured); transmit survives past the old ~68 min failure (seen up for 1.8 h) |
@@ -96,10 +97,27 @@ holds it in reset.
 ## Build, flash, watch
 
 ```bash
-. ~/esp/esp-idf/export.sh
-idf.py build
+. ~/esp/esp-idf-v5.5.6/export.sh
+idf.py build                                  # ESP32-P4 v1.x chips
 idf.py -p /dev/ttyACM0 flash
 ```
+
+**Check the chip revision first.** Boards are now shipping with ESP32-P4
+**v3.x** (the second DAC8 is v3.2), and v1.x and v3.x need different images:
+the bootloader built for one refuses the other (esptool: "requires chip
+revision in range [v0.1 - v1.99]"). esptool prints `Chip is ESP32-P4
+(revision vX.Y)` when it connects. For v3.x:
+
+```bash
+V3='-B build-p4v3 -D SDKCONFIG=sdkconfig.p4v3 -D SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.p4v3'
+idf.py $V3 build
+idf.py $V3 -p /dev/ttyACM0 erase-flash flash   # erase once on a new board
+```
+
+A v3.x chip runs at 400 MHz (v1.x: 360). The web update keeps the two apart:
+the firmware product is `dac8` (v1.x) or `dac8v3` (v3.x), and the DAC8 refuses
+an image whose chip-revision range does not include its own chip ("firmware is
+for another chip revision").
 
 Console is UART at 115200. On this board, **opening the serial port can reset
 the chip** (the CH343's DTR/RTS drive EN and the boot strap), so read logs with
@@ -112,6 +130,76 @@ tools/stats.py 169.254.3.29 watch 120  # follow, and report drift at the end
 ```
 
 Subscriptions are stored in NVS and come back on their own after a reboot.
+
+USB is needed once, for the first flash with two app slots (it also writes the
+new partition table and bootloader); after that, updates go through the web
+page. The NVS settings survive that first flash: `nvs` and `phy_init` kept
+their offsets.
+
+## Web page and firmware update
+
+Open `http://169.254.3.29/` (the DAC8's address, as Dante Controller shows it)
+from a computer on the Dante network:
+
+- **Status**: name, address, clock lock and offset, rate, latency, flows, late
+  packets, what each output receives.
+- **Output volume**: −60 to +4 dB in 1 dB steps for all 8 outputs, kept in
+  NVS; **Mute**, not kept (after a power cycle there is sound again).
+- **Firmware**: installed and latest version, **Install** (from the update
+  server), install a `.fw` file by hand, and **Go back** to the previous one.
+
+**The browser does the internet part.** The DAC8 has only its link-local Dante
+address and no route out, but the computer showing the page usually has one
+(Wi-Fi next to the Dante port). The page asks the update server
+(`.secrets/update-url`, built in) for the latest version, the same server the
+Mac app reports to; that request also records the DAC8 there (MAC, name,
+version, rate, latency, volume, flows, uptime) on its **Devices** page. So a
+DAC8 is seen only when someone opens its page; it cannot report on its own the
+way the Mac app does daily. Without internet on that computer, the page still
+works and says the server is not reachable.
+
+**Signed images.** A `.fw` is the app image plus a 128-byte trailer with an
+ECDSA P-256 signature (`tools/fwsign.py`). `web.c` writes the image to the app
+slot that is not running, checks the signature against
+`main/fw_sign_pub.pem` and the project name, and only then boots it. Anything
+else is refused (tested: random data 400; wrong key, one flipped bit, no
+signature 403) and the spare slot is wiped, so **Go back** can only boot
+firmware that was verified. The private key is `.secrets/fw-sign-key.pem`,
+not in git: **keep a copy**; without it no update can be made for boards
+already in the field (they would need USB again).
+
+**Trial and rollback.** A new image boots on trial and confirms itself after
+60 s. A reset before that (crash, power cut) makes the bootloader start the
+previous image again (tested with a hard reset during the trial). An update
+started during a trial confirms the running image first, since ESP-IDF will
+not start an update from an unconfirmed one.
+
+The update mutes the outputs (flash writes stop both cores' caches), takes ~8 s
+for 750 KB, and the DAC8 is back with clock lock ~20 s later.
+
+**Every software restart is a full system reset now.** `esp_restart()` on the
+P4 resets only the CPUs (`rst:0xc`); the Ethernet DMA and the AXI bus keep
+running. Interrupted mid-transfer, the next boot's RX DMA stayed in "fetching
+descriptor" for good: no frame received, not cleared by an EMAC restart, a PHY
+reset or esp_eth's own reset; only a power cycle helped (2 of 3 restarts from
+the web page). `eth_ts_reboot()` stops both DMA directions, waits until idle,
+then resets the whole system (`rst:0x3`); 9 of 9 restarts clean afterwards. The
+controller's rate change and the RX-FIFO-hang reboot use it too.
+
+### Making a release
+
+```bash
+echo 1.0.1 > version.txt
+tools/release.sh "What changed, one or two lines."
+```
+
+That builds both chip variants, checks the version, signs, and writes
+`N-Series-DAC8-<version>.fw` and `manifest.json` to `dist/dac8/` (v1.x chips)
+and `dist/dac8v3/` (v3.x chips). Copy both folders to the server's
+`data/firmware/` (QNAP: `/share/Container/N-Serie-AoIP-Server/data/firmware/`);
+the next time a DAC8 page is opened it offers the update for its own chip. One-time setup:
+`tools/fwsign.py keygen` (already done; the public key is in `main/`) and
+`.secrets/update-url` with the server's address.
 
 ---
 
@@ -335,21 +423,36 @@ On the bench the Leader's Syncs arrive **late by +9..19 µs every 88–89 s, for
 1500-byte frame on the board's 100 Mbit link: something on the network floods
 a burst toward this port and Sync queues behind it (source not identified).
 
-The servo used to "correct" each jump as a phase shift (4 agreeing outliers,
-1 s), then sat that far off the other way when it ended, and dropped lock:
-Sync red in the controller many times a day. Now, while locked:
+Those bursts are gone (they were very likely the searchfire mDNS bursts from
+the Mac), but the 100 Mbit port still delays ~8% of Syncs by 1–10 µs: one
+small audio frame from the transmitter is on the wire ahead of them. They come
+in runs of up to 11.
 
-- an offset more than **4 µs** from the filtered value is an outlier (was 10 µs;
-  steady-state scatter is ~0.3 µs, and jumps under 10 µs used to drag the
-  median and the clock with them);
-- the rate is held through up to **80 outliers (20 s)**;
-- a phase shift needs **60 agreeing ones (15 s)**: a real shift, such as the
-  one at a flow start, is still corrected, 15 s later;
-- the heartbeat reports the **filtered** offset, not the last raw Sync.
+### Low-edge filter (replaced the median and outlier gate, 2026-10-13)
 
-10 minutes of steady running with the jumps present: raw offset up to 20 µs,
-offset reported to the controller at most 2.5 µs, 0 lock losses, 0 shifts
-(before: 5 lock drops and 5 false shifts in 10 minutes).
+Queueing only ever makes a Sync **late**, so it only ever reads the offset
+too **high**; the true offset is the low edge of the scatter. The servo now
+filters on the **2nd-lowest of a window** of offsets: 8 Syncs while acquiring,
+growing to 32 (8 s) over the first ~24 s of lock. Each sample is stored with
+the servo's own phase correction taken out, so a sample 8 s old still compares
+with one from now.
+
+The median + outlier gate it replaced failed like this, 3 h of bench
+telemetry: a late Sync slipped into the median and froze the filtered value,
+every *correct* sample after it was then "an outlier", the servo held a stale
+rate for 15–25 s, the clock walked 8–20 µs off and was "phase shifted" back
+with an overshoot. 4 false shifts and 5 lock losses in 3 h; after one of
+them the audio clock had followed a wrong rate for 24 s and the playout was
+82 samples off -- 9 s of late packets.
+
+| same recorded Sync jitter, 2 h, host test of `ptp_servo.c` | max offset | rms | lock losses |
+|---|---|---|---|
+| median + outlier gate | 25–53 µs | 3.5–6.6 µs | 2–4 |
+| low edge | 2.4–4.5 µs | 0.2–0.5 µs | 0 |
+
+The path delay is paired with the **filtered** t2 − t1 instead of the last
+Sync's, which put half of every late Sync into the average (it read
+13.2–16.5 µs on a path that does not move).
 
 ### Outliers and phase shifts (the old "71 s step")
 
@@ -370,18 +473,18 @@ The old servo mishandled it twice:
    and 50 s later it crossed 1 ms and stepped. That was the 1 ms step **~71 s
    after every boot**.
 
-Now, while locked:
-
-| samples far (> 10 µs) from the last accepted value | action |
-|---|---|
-| 4 in a row that agree within 5 µs | a real **phase shift**: one small step, rate and lock kept, path delay re-measured at 4 Hz |
-| up to 8 in a row, scattered | spikes: held out of the median, the rate is held |
-| more than 8 | real movement: reseed the median and servo on it |
+Now, while locked, a **jump** is the window's low edge itself beyond 8 µs for
+8 Syncs (2 s). Late Syncs cannot cause that (they never move the low edge), so
+it is the path or the Leader's phase. It is taken as one small phase step with
+rate and lock kept, the path delay re-measured at 4 Hz, and the rate held
+while it is being confirmed. Fed to the PI instead, a −36 µs jump lost lock and
+swung the rate estimate by 5.8 ppm (simulated). Three jumps within 30 s mean a
+clock that will not settle: unlock and re-acquire.
 
 A step under 100 µs (< 5 samples) does **not** re-anchor the audio; it is
 absorbed as phase error instead of making a click. Measured after the fix: lock
 at 14.5 s, the flow-start shift corrected in ~1 s with lock kept, no lock
-losses and no steps after boot (`ptp_phase_shifts` counts these).
+losses and no steps after boot (`ptp_phase_shifts` counts jump corrections).
 
 ## Control plane
 
@@ -404,11 +507,19 @@ Receiving a flow:
   every 5 s, even while other flows play.
 - **Request** with flow-control opcode `0x0100` to the transmitter's 4455:
   one flow per transmitter, carrying every channel subscribed to it.
-- **Keepalive**: `13 37`, every 250 ms, **from the audio socket to the audio
-  source address**. Opcode `0x0102` is not a keepalive. A transmitter drops a
-  flow after ~4 s without the real one. Every `sendto()` is checked and
-  counted (`rx_ka_sent` / `rx_ka_failed` / `rx_ka_errno`); a keepalive that
-  silently fails to send is invisible otherwise.
+- **Keepalive**: `13 37`, every **100 ms**, **from the audio socket to the
+  audio source address**, on its own task. Opcode `0x0102` is not a
+  keepalive. Inferno's transmitter waits 4 s, but a **Prodigy (Brooklyn-3)
+  drops a flow after ~1 s** without one (measured from a PC: no keepalive,
+  audio stopped after 1.1 s; `13 37` every 250 ms, 180 s without a drop). At
+  250 ms from the receive loop the DAC8 lost its Prodigy flow 7 times in 30
+  minutes, ~10 s of silence each: the gap log showed ~940 ms without a
+  keepalive each time (cause: the IDF driver stall, see "Patched ESP-IDF
+  Ethernet driver"), the Prodigy then answered the stop with `0x0103`
+  "expired". (Copying the Prodigy's own receiver keepalive, `02 00 00 00` + a
+  u32 counter, made it worse: a drop every 16 s.) Every `sendto()` is checked
+  and counted (`rx_ka_sent` / `rx_ka_failed` / `rx_ka_errno`), and so are the
+  gaps (`rx_ka_gap_max_us`, `rx_ka_gaps_500ms`, a log line over 500 ms).
 - **Liveness**: a flow whose packet count stops for 3 s is torn down and
   re-requested.
 - **Status must be current**: a rebuild works on a snapshot and can take
@@ -571,6 +682,29 @@ The phase error stayed at 0–3 frames with no steps throughout. Late packets
 start where the DVS's own send timing runs out; a hardware transmitter is
 needed to find the receiver's real floor below 1.5 ms.
 
+### Patched ESP-IDF Ethernet driver (`components/esp_eth`)
+
+The project carries a copy of IDF v5.5.6's `esp_eth` (a project component
+overrides the IDF one of the same name) with one change, marked
+`N-Series DAC8 PATCH` in `src/mac/esp_eth_mac_esp_dma.c`:
+`emac_esp_dma_get_remain_frames()` stops at the first complete frame.
+
+IDF's `emac_rx` task calls it after **every** frame to ask "is there another
+one?", and it answered by walking every descriptor the CPU owns, with a cache
+invalidate per descriptor: O(backlog) work per frame. Once any hiccup filled
+the ring, a 96 kHz flow (fpp 8, one frame every 83 µs) cost **104 µs per frame
+in the driver** (13 µs in our hook), the backlog never drained, and `emac_rx`
+(priority 24) held core 0 for 0.7–1.2 s, every 1–3 minutes. Nothing else on
+core 0 ran: PTP, the receive loop, the keepalive. A Prodigy drops a flow after
+~1 s without a keepalive, so each stall was ~10 s of silence ("transmitter
+refused 0x0103"), plus lock losses and a watchdog reset. Found with the stall
+detector in `aoip_rx.c` (core 1 samples which task core 0 runs; it logs
+`core-0 stall N ms, F frames, per frame: hook X us, driver Y us`).
+
+After the patch, 30 minutes: 0 stalls, 0 flow drops, 0 late packets, 0 lock
+losses, longest keepalive gap 111 ms, PTP offset within ±1.2 µs (rms 0.33 µs).
+`free_descs` is only used by IDF's soft flow control, which is off.
+
 ### Audio decoded in the EMAC receive task
 
 `eth_ts.c` already sees every frame in IDF's `emac_rx` task (that is how PTP
@@ -580,7 +714,7 @@ into the ring there, and freed: it never reaches lwIP's tcpip thread, the
 socket, `select()` or the `aoip_rx` task. The socket stays bound only to SEND
 the flow keepalive from the audio port; nothing in the fast path calls lwIP
 (emac_rx feeds lwIP, so a send from there could wait on itself), so the
-first-packet keepalive is flagged to the `aoip_rx` task. `X0` / `X1` on UDP
+first-packet keepalive is flagged to the keepalive task. `X0` / `X1` on UDP
 7779 switches between the paths for comparison.
 
 A/B on the same build and source, 2 ms, 60 s windows:
@@ -632,6 +766,8 @@ The fields that matter most:
 | `jb_underrun_frames`, `jb_pkt_late` | buffer health (underruns also count silence before a flow exists) |
 | `rx_packets`, `flow_ka_ok/lost` | flow health (the `ka` counters are the liveness checks) |
 | `rx_ka_sent`, `rx_ka_failed`, `rx_ka_errno` | flow keepalives sent / refused by the stack; failures mean transmit trouble |
+| `rx_ka_gap_max_us`, `rx_ka_send_max_us`, `rx_ka_gaps_500ms` | longest gap between keepalives, longest `sendto()`, gaps over 500 ms (a Prodigy drops the flow at ~1 s; flow re-requests count too) |
+| `rx_src_other`, `rx_src_other_port` | audio packets from a source other than the one the keepalive goes to |
 | `fc_last_op`, `fc_last_code`, `fc_refused`, `fc_timeouts`, `flow_fallbacks` | flow-control requests: last opcode and the transmitter's answer (`0xFFFF` no reply, `0xFFFE` could not send) |
 | `eth_rx_kicks`, `eth_rx_restarts`, `eth_phy_resets` | receive watchdog actions (should stay 0) |
 | `reset_reason` | why the board last started: 1 power-on, 3 software, 4 panic, 5–7 watchdog, 9 brown-out |
@@ -671,14 +807,16 @@ ASCII **without a trailing newline** (`echo -n`), one reply back.
 
 | command | effect | saved |
 |---|---|---|
-| `G<dB>` | output gain 0..12 dB, saturating; `G` alone reads it | yes (NVS) |
+| `G<dB>` | output volume −60..+4 dB, saturating; `G` alone reads it (also on the web page) | yes (NVS) |
 | `F<us>` / `F0` | force the playout latency (down to the minimum) / off | no |
 | `X1` / `X0` | audio decoded in the EMAC task (default) / through lwIP | no |
 | `?` | status, `key=value` lines | |
 | `L` | recent non-routine controller requests, hex | |
+| `P` | DAC pin levels now, % of samples high (clocks ~50 %, DIN1 0 % = digital silence, RST 100 % = out of reset); safe while playing | |
+| `D<rr><vv>` | bench: write DAC register 0x<rr> = 0x<vv> (hex), e.g. `D4106` = 24-bit I2S TDM; SPI is write-only | no |
 
 ```bash
-echo -n G6 | nc -u -w1 169.254.3.29 7779      # +6 dB
+echo -n G-6 | nc -u -w1 169.254.3.29 7779     # -6 dB
 ```
 
 Sample rate, latency, subscriptions and names are set in AoIP Controller and
@@ -705,7 +843,9 @@ stored on the device.
 | `aoip_mdns.[ch]` | our advertisement |
 | `aoip_msg.[ch]` | request/response builder (absolute string offsets) |
 | `telem.[ch]`, `console.[ch]` | telemetry and console |
+| `web.[ch]`, `web_page.html`, `fw_sign_pub.pem` | web page: status, volume, signed firmware update |
 | `tools/stats.py`, `tools/arc_probe.py` | snapshot/drift, raw ARC probe |
+| `tools/release.sh`, `tools/fwsign.py` | signed release for the update server; signing key |
 
 ## Known issues
 

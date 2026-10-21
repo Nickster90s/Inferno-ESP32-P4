@@ -1,5 +1,15 @@
 CONFIG_IDF_TARGET="esp32p4"
 
+# --- Chip revision ---------------------------------------------------------
+# Needs ESP-IDF v5.5.6 (components/esp_eth is its copy). ESP32-P4 v3.x chips
+# differ enough that one image cannot run on both: this file builds for v1.x
+# (the first DAC8 boards); sdkconfig.defaults.p4v3 switches to v3.x.
+#   v1.x: idf.py build                       (sdkconfig, build/)
+#   v3.x: idf.py -B build-p4v3 -D SDKCONFIG=sdkconfig.p4v3 \
+#           -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.p4v3" build
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_1=y
+
 # --- Partition table -------------------------------------------------------
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -52,6 +62,10 @@ CONFIG_LWIP_TCPIP_TASK_PRIO=18
 CONFIG_LWIP_SO_RCVBUF=y
 CONFIG_LWIP_AUTOIP=y
 CONFIG_LWIP_DHCP_RESTORE_LAST_IP=y
+# 24, not 10: up to 4 flow sockets, telemetry, ARC, info, PTP join and the
+# flows client already came close to 10, and the web server (main/web.c)
+# takes up to 7 more. At 10 a flow could not bind its socket during an upload.
+CONFIG_LWIP_MAX_SOCKETS=24
 
 # --- mDNS ------------------------------------------------------------------
 CONFIG_MDNS_MAX_SERVICES=64
@@ -69,3 +83,9 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 # ~93 us of a 167 us period at 96 kHz / 16-frame blocks (a 128-sample peak
 # meter alone cost 48 us), and packet receive saturated core 1.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# --- Web update (main/web.c) ------------------------------------------------
+# A new image boots once on trial and marks itself valid after 60 s; if it
+# resets before that, the bootloader boots the previous one again.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

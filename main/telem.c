@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include "app_config.h"
+#include "pcm1690.h"
 #include "rate.h"
 #include "ptpv1.h"
 #include "media_clock.h"
@@ -125,6 +126,11 @@ static int build_stats(char *out, size_t cap)
         "rx_bad_magic=%u\n"
         "rx_short=%u\n"
         "rx_wrong_len=%u\n"
+        "rx_ka_gap_max_us=%u\n"
+        "rx_ka_send_max_us=%u\n"
+        "rx_ka_gaps_500ms=%u\n"
+        "rx_src_other=%u\n"
+        "rx_src_other_port=%u\n"
         "rx_ka_sent=%u\n"
         "rx_ka_failed=%u\n"
         "rx_ka_errno=%d\nrx_lat_max_samples=%d\nrx_fast_packets=%u\nrx_fast_path=%d\n"
@@ -168,6 +174,8 @@ static int build_stats(char *out, size_t cap)
         (unsigned)jb.playout_steps,
         (unsigned)rx.packets, (unsigned)rx.bad_magic, (unsigned)rx.short_pkt,
         (unsigned)rx.wrong_len,
+        (unsigned)rx.ka_gap_max_us, (unsigned)rx.ka_send_max_us, (unsigned)rx.ka_gaps_500ms,
+        (unsigned)rx.src_other, (unsigned)rx.src_other_port,
         (unsigned)rx.ka_sent, (unsigned)rx.ka_failed, (int)rx.ka_last_errno, (int)rx.lat_max_samples, (unsigned)rx.fast_packets, (int)aoip_rx_fast_path(),
         (unsigned)g_flows_diag.last_opcode, (unsigned)g_flows_diag.last_code,
         (unsigned)g_flows_diag.refused, (unsigned)g_flows_diag.timeouts,
@@ -258,6 +266,18 @@ static void telem_task(void *arg)
             q[qn < (int)sizeof(q) ? qn : (int)sizeof(q) - 1] = 0;
             mclk_force_latency_us((uint32_t)atoi(q + 1));
             int len = snprintf(txt, sizeof(txt), "latency %u us\n", (unsigned)mclk_get_latency_us());
+            sendto(stats, txt, (size_t)len, 0, (struct sockaddr *)&from, flen);
+        } else if (qn > 0 && q[0] == 'P') {
+            // DAC pin levels now (pcm1690.c): DIN1 shows whether audio goes out.
+            int len = pcm1690_pin_check(txt, sizeof(txt));
+            sendto(stats, txt, (size_t)(len > 0 ? len : 1), 0, (struct sockaddr *)&from, flen);
+        } else if (qn >= 5 && q[0] == 'D') {
+            // Bench: raw DAC register write, "D<reg hex><val hex>", e.g. D4106.
+            char h[3] = { q[1], q[2], 0 }, v[3] = { q[3], q[4], 0 };
+            uint8_t reg = (uint8_t)strtoul(h, NULL, 16), val = (uint8_t)strtoul(v, NULL, 16);
+            esp_err_t err = pcm1690_write(reg, val);
+            int len = snprintf(txt, sizeof(txt), "dac reg 0x%02x = 0x%02x: %s\n",
+                               reg, val, esp_err_to_name(err));
             sendto(stats, txt, (size_t)len, 0, (struct sockaddr *)&from, flen);
         } else if (qn > 0 && q[0] == 'L') {
             // Request log (reqlog.c): what controllers have been asking.

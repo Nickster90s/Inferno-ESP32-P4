@@ -3,7 +3,7 @@
 
 // Gains: FPGA project firmware/ptpv1.c. Sync arrives at ~4 Hz on an AoIP
 // network rather than gPTP's 8 Hz, which is why the integral gain is scaled
-// down from the gPTP value and the median is wider.
+// down from the gPTP value.
 //
 // LOCKED gains. The FPGA's (kp 0.072 / 0.2 fast, ki 0.0009) held a thermally
 // settled crystal, but this board's crystal WARMS UP after power-on and walks
@@ -29,52 +29,61 @@
 #define KP_ACQ_NUM      500         // /KP_DEN
 #define KP_ACQ_FAST_NUM 700
 #define KI_ACQ_NUM      40000       // /KI_DEN, per Sync
-// More in a row than this is movement, not a spike: 80 Syncs = 20 s.
-// A phase shift needs PS_SHIFT_N (ptp_servo.h) agreeing ones = 15 s.
-//
-// Both used to be far shorter (2 s / 1 s, sized for the ~0.75 s transient at a
-// flow start). On the bench the Leader's offset then jumped +15..21 us every
-// ~90 s for 2-5 s and came back by itself. Each jump was "corrected" as a
-// phase shift, the clock was then that far off the other way when it ended,
-// and the re-convergence dropped lock: Sync red in the controller many times
-// a day. A real shift persists and is still corrected, 15 s later.
-//
-// The jumps are +9..19 us, every 88-89 s, 4-7 s long (6 s was too short): Syncs
-// arriving LATE by about one 1500-byte frame time on our 100 Mbit link --
-// something on the network floods a burst toward this port and Sync queues
-// behind it.
-#define OUTLIER_RUN_MAX 80
-#define SHIFT_N         PS_SHIFT_N
-#define SHIFT_SPREAD_NS 5000        // ... agreeing within this
-
-void ptp_servo_init(ptp_servo_t *s, uint8_t median_n)
+void ptp_servo_init(ptp_servo_t *s)
 {
     memset(s, 0, sizeof(*s));
-    s->median_n = median_n ? (median_n > PS_MEDIAN_MAX ? PS_MEDIAN_MAX : median_n) : 7;
 }
 
 void ptp_servo_reset(ptp_servo_t *s)
 {
-    uint8_t n = s->median_n;
     memset(s, 0, sizeof(*s));
-    s->median_n = n;
 }
 
-static int64_t median_push(ptp_servo_t *s, int64_t v)
+void ptp_servo_clear_filter(ptp_servo_t *s)
 {
-    s->median_buf[s->median_pos] = v;
-    s->median_pos = (uint8_t)((s->median_pos + 1) % s->median_n);
-    if (s->median_count < s->median_n) s->median_count++;
+    s->win_pos = 0;
+    s->win_count = 0;
+    s->comp_ns = 0;
+}
 
-    int64_t tmp[PS_MEDIAN_MAX] = {0};    // = {0}: -O2 cannot see count >= 1
-    for (uint8_t i = 0; i < s->median_count; i++) tmp[i] = s->median_buf[i];
-    for (uint8_t i = 1; i < s->median_count; i++) {
+// LOW-PERCENTILE FILTER (see ptp_servo.h for why not a median).
+//
+// The samples are stored with the servo's own phase correction taken out:
+// comp_ns is the phase the P term (output minus rate estimate) has moved the
+// clock by since the window was cleared, so `offset - comp` of a sample 8 s old
+// compares with one from now. What it cannot take out is the rate estimate's
+// own error, which is why the window is short while acquiring and grows only
+// once locked (a ~1 ppm rate error right after lock is 1 us/s of ramp, and the
+// low edge of a full 8 s window lags a rising ramp by all of it -- simulated:
+// 10 us excursions after lock with the full window from the start, 3.7 us with
+// the window growing over 24 s).
+static int64_t window_push(ptp_servo_t *s, int64_t offset_ns)
+{
+    s->win[s->win_pos] = offset_ns - s->comp_ns;
+    s->win_pos = (uint8_t)((s->win_pos + 1) % PS_WIN_LOCKED);
+    if (s->win_count < PS_WIN_LOCKED) s->win_count++;
+
+    if (s->locked) {
+        if (s->win_n4 < PS_WIN_LOCKED * 4) s->win_n4++;   // +1 sample per 4 Syncs
+    } else {
+        s->win_n4 = PS_WIN_ACQ * 4;
+    }
+    uint8_t n = s->win_n4 / 4;
+    if (n < PS_WIN_ACQ) n = PS_WIN_ACQ;
+    if (n > s->win_count) n = s->win_count;
+
+    // The n newest, sorted.
+    int64_t tmp[PS_WIN_LOCKED] = {0};    // = {0}: -O2 cannot see n >= 1
+    for (uint8_t i = 0; i < n; i++)
+        tmp[i] = s->win[(s->win_pos + PS_WIN_LOCKED - 1 - i) % PS_WIN_LOCKED];
+    for (uint8_t i = 1; i < n; i++) {
         int64_t k = tmp[i];
         int j = (int)i - 1;
         while (j >= 0 && tmp[j] > k) { tmp[j + 1] = tmp[j]; j--; }
         tmp[j + 1] = k;
     }
-    return tmp[s->median_count / 2];
+    uint8_t r = n > PS_WIN_RANK ? PS_WIN_RANK : (uint8_t)(n - 1);
+    return tmp[r] + s->comp_ns;
 }
 
 // FREQUENCY PRE-ESTIMATE.
@@ -135,8 +144,8 @@ int32_t ptp_servo_update(ptp_servo_t *s, int64_t offset_ns, int64_t t_ns,
     if (offset_ns > PS_STEP_NS || offset_ns < -PS_STEP_NS) {
         *step_ns = -offset_ns;
         s->integral_ns = 0;
-        s->median_count = 0;
-        s->median_pos = 0;
+        ptp_servo_clear_filter(s);
+        s->last_t_ns = 0;
         s->steps++;
         s->locked = false;
         s->lock_streak = 0;
@@ -154,59 +163,45 @@ int32_t ptp_servo_update(ptp_servo_t *s, int64_t offset_ns, int64_t t_ns,
 
     if (!s->est_done) return estimate(s, offset_ns, t_ns);
 
-    // OUTLIERS, while locked. Judged against the last ACCEPTED filtered value
-    // and kept OUT of the median: letting them in meant four of them flipped a
-    // 7-sample median and were then accepted as truth.
-    //
-    // Three outcomes (bench, flow start: the Leader->us delay fell ~36 us and
-    // stayed there once audio was flowing):
-    //   SHIFT_N in a row that agree within SHIFT_SPREAD_NS -> the timing really
-    //       moved. Correct it as a PHASE step, keep rate and lock. Answering it
-    //       with a frequency kick overshot for 8 s and dropped lock.
-    //   up to OUTLIER_RUN_MAX scattered ones -> spikes; hold the rate.
-    //   more than that, scattered -> real movement; reseed and servo on it.
-    if (s->locked && s->median_count >= s->median_n) {
-        // 4 us, not 10: steady-state scatter is ~0.3 us (median |offset|),
-        // and the network jumps (+9..19 us) partly slipped under 10 us, moved
-        // the median, and dragged the clock -- and the offset reported to the
-        // controller -- along with them.
-        int64_t d = offset_ns - s->filtered_ns;
-        if (d > PS_OUTLIER_NS || d < -PS_OUTLIER_NS) {
-            if (s->outlier_run < SHIFT_N) s->orun[s->outlier_run] = offset_ns;
-            s->outlier_run++;
-            s->outliers++;
-            if (s->outlier_run == SHIFT_N) {
-                int64_t mn = s->orun[0], mx = s->orun[0], sum = 0;
-                for (int k = 0; k < SHIFT_N; k++) {
-                    if (s->orun[k] < mn) mn = s->orun[k];
-                    if (s->orun[k] > mx) mx = s->orun[k];
-                    sum += s->orun[k];
-                }
-                if (mx - mn < SHIFT_SPREAD_NS) {
-                    *step_ns = -(sum / SHIFT_N);
-                    s->median_count = 0;
-                    s->median_pos = 0;
-                    s->outlier_run = 0;
-                    s->filtered_ns = 0;
-                    s->shifts++;
-                    s->applied_ppb = s->rate_ppb;
-                    return s->applied_ppb;
-                }
-            }
-            if (s->outlier_run <= OUTLIER_RUN_MAX) {
-                s->applied_ppb = s->rate_ppb;       // hold the RATE, no P kick
-                return s->applied_ppb;
-            }
-            // Persistent and scattered: real movement. Reseed and servo.
-            for (uint8_t k = 0; k < s->median_n; k++) s->median_buf[k] = offset_ns;
-            s->median_count = s->median_n;
-        }
-    }
-    s->outlier_run = 0;
+    // The phase the P term moved the clock by since the last Sync: what the
+    // last output applied beyond the rate estimate, for that long.
+    if (s->last_t_ns && t_ns > s->last_t_ns && t_ns - s->last_t_ns < 2000000000LL)
+        s->comp_ns += ((int64_t)(s->applied_ppb - s->rate_ppb) * (t_ns - s->last_t_ns))
+                      / 1000000000LL;
+    s->last_t_ns = t_ns;
 
-    int64_t f = median_push(s, offset_ns);
+    int64_t f = window_push(s, offset_ns);
 
     s->filtered_ns = f;
+
+    if (s->locked) {
+        int64_t m = f < 0 ? -f : f;
+        if (m > PS_JUMP_NS) {
+            if (++s->jump_run < PS_JUMP_N) {
+                s->applied_ppb = s->rate_ppb;   // hold the rate, keep it out of the PI
+                return s->applied_ppb;
+            }
+            s->jump_run = 0;
+            if (s->last_jump_t_ns && t_ns - s->last_jump_t_ns < 30000000000LL)
+                s->jump_strikes++;
+            else
+                s->jump_strikes = 1;
+            s->last_jump_t_ns = t_ns;
+            if (s->jump_strikes < PS_JUMP_STRIKES) {
+                *step_ns = -f;
+                ptp_servo_clear_filter(s);
+                s->shifts++;
+                s->applied_ppb = s->rate_ppb;
+                return s->applied_ppb;
+            }
+            s->jump_strikes = 0;
+            s->locked = false;
+            s->lock_streak = 0;
+            s->integral_ns = -((int64_t)s->rate_ppb * KI_DEN) / KI_ACQ_NUM;
+        } else {
+            s->jump_run = 0;
+        }
+    }
 
     bool big = (f > 1000 || f < -1000);
     int64_t p_num  = s->locked ? (big ? KP_FAST_NUM : KP_NUM)

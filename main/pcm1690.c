@@ -1,9 +1,11 @@
 #include "pcm1690.h"
+#include <stdio.h>
 #include "rate.h"
 #include "app_config.h"
 #include "driver/spi_master.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "driver/pulse_cnt.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -183,10 +185,39 @@ static void release_usb_pads(void)
     USB_WRAP.otg_conf.usb_pad_enable = 0;
 }
 
+// Rising edges on a pin for 1 ms, with the pulse counter listening on the pin's
+// input path (the output keeps running): the real frequency of a clock in kHz.
+// -1 if no counter unit is free.
+static int edge_rate_khz(int pin)
+{
+    pcnt_unit_config_t ucfg = { .low_limit = -1, .high_limit = 32767 };
+    pcnt_unit_handle_t unit = NULL;
+    if (pcnt_new_unit(&ucfg, &unit) != ESP_OK) return -1;
+    pcnt_chan_config_t ccfg = { .edge_gpio_num = pin, .level_gpio_num = -1 };
+    pcnt_channel_handle_t ch = NULL;
+    int count = -1;
+    if (pcnt_new_channel(unit, &ccfg, &ch) == ESP_OK) {
+        pcnt_channel_set_edge_action(ch, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_HOLD);
+        pcnt_unit_enable(unit);
+        pcnt_unit_clear_count(unit);
+        pcnt_unit_start(unit);
+        esp_rom_delay_us(1000);
+        pcnt_unit_stop(unit);
+        pcnt_unit_get_count(unit, &count);
+        pcnt_unit_disable(unit);
+        pcnt_del_channel(ch);
+        gpio_pullup_dis(pin);
+    }
+    pcnt_del_unit(unit);
+    return count;
+}
+
 // Sample each DAC pin and report the fraction of samples that read high:
 // ~50% is a running clock, 0/100% a static level. A pin that reads the
-// opposite of what we drive is owned or loaded by something else.
-void pcm1690_pin_check(void)
+// opposite of what we drive is owned or loaded by something else. Safe while
+// audio plays (it only enables the input buffers); DIN1 then reads 0% for
+// digital silence and something in between for audio.
+int pcm1690_pin_check(char *out, size_t n)
 {
     static const struct { int pin; const char *name; } p[] = {
         { AP_PIN_I2S_MCLK, "MCK " }, { AP_PIN_I2S_BCLK, "BCK " },
@@ -194,13 +225,19 @@ void pcm1690_pin_check(void)
         { AP_PIN_DAC_SPI_CS, "CS  " }, { AP_PIN_DAC_SPI_CLK, "SCL " },
         { AP_PIN_DAC_SPI_MOSI, "SDA " }, { AP_PIN_DAC_RST, "RST " },
     };
+    int len = 0;
     for (size_t i = 0; i < sizeof(p) / sizeof(p[0]); i++) {
         if (p[i].pin < 0) continue;
         gpio_input_enable(p[i].pin);
         int hi = 0;
         for (int k = 0; k < 2000; k++) hi += gpio_get_level(p[i].pin);
-        ESP_LOGI(TAG, "pin check  %s GPIO%-2d  high %3d%%", p[i].name, p[i].pin, hi / 20);
+        int khz = edge_rate_khz(p[i].pin);
+        ESP_LOGI(TAG, "pin check  %s GPIO%-2d  high %3d%%  %6d kHz", p[i].name, p[i].pin, hi / 20, khz);
+        if (out && len >= 0 && (size_t)len < n)
+            len += snprintf(out + len, n - len, "%s GPIO%-2d high %3d%%  %6d kHz\n",
+                            p[i].name, p[i].pin, hi / 20, khz);
     }
+    return out && (size_t)len >= n ? (int)n - 1 : len;
 }
 
 esp_err_t pcm1690_init(void)
@@ -256,7 +293,7 @@ esp_err_t pcm1690_start(void)
     }
 
     if (s_bus == BUS_SPI) park();
-    pcm1690_pin_check();
+    pcm1690_pin_check(NULL, 0);
 
     uint8_t fmt = 0;
     if (rd(REG_FORMAT, &fmt) == ESP_OK) {
@@ -278,6 +315,15 @@ esp_err_t pcm1690_set_mute(bool mute)
 {
     esp_err_t err = wr(REG_SOFT_MUTE, mute ? 0xFF : 0x00);
     if (s_bus == BUS_SPI) park();
+    return err;
+}
+
+// Bench access to the control port: one register write (SPI cannot read back).
+esp_err_t pcm1690_write(uint8_t reg, uint8_t val)
+{
+    esp_err_t err = wr(reg, val);
+    if (s_bus == BUS_SPI) park();
+    ESP_LOGW(TAG, "write reg %u = 0x%02x (%s)", reg, val, esp_err_to_name(err));
     return err;
 }
 

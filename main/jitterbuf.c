@@ -38,19 +38,21 @@ static uint32_t s_isr_max_us;
 // OUTPUT GAIN. The PCM1690 is already at 0 dB (its attenuators only cut), and
 // the breakout takes VOUT+ alone -- half the differential swing. Digital gain
 // is the remaining lever: Q16, applied as packets are written, saturating so
-// a hot source clips instead of wrapping. 0..+12 dB, kept in NVS.
+// a hot source clips instead of wrapping. -60..+4 dB (the web page's volume),
+// kept in NVS. Mute is not kept: after a power cycle there is sound again.
 // ---------------------------------------------------------------------------
 #include <math.h>
 #include "nvs.h"
 static volatile uint32_t s_gain_q16 = 65536;
 static int s_gain_db;
+static volatile bool s_mute;
 
 static void gain_apply(int db)
 {
-    if (db < 0) db = 0;
-    if (db > 12) db = 12;
+    if (db < JB_GAIN_MIN_DB) db = JB_GAIN_MIN_DB;
+    if (db > JB_GAIN_MAX_DB) db = JB_GAIN_MAX_DB;
     s_gain_db = db;
-    s_gain_q16 = (uint32_t)lroundf(65536.0f * powf(10.0f, db / 20.0f));
+    s_gain_q16 = s_mute ? 0 : (uint32_t)lroundf(65536.0f * powf(10.0f, db / 20.0f));
 }
 
 void jb_set_gain_db(int db)
@@ -63,6 +65,14 @@ void jb_set_gain_db(int db)
         nvs_close(h);
     }
 }
+
+void jb_set_mute(bool on)
+{
+    s_mute = on;
+    gain_apply(s_gain_db);
+}
+
+bool jb_get_mute(void) { return s_mute; }
 
 int jb_get_gain_db(void) { return s_gain_db; }
 

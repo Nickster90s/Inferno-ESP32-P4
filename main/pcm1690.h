@@ -22,9 +22,11 @@ esp_err_t pcm1690_init(void);
 esp_err_t pcm1690_start(void);
 
 esp_err_t pcm1690_set_mute(bool mute);
+esp_err_t pcm1690_write(uint8_t reg, uint8_t val);   // bench: one raw register write
 
-// Log what each DAC pin actually reads (clock ~50%, static 0/100%).
-void pcm1690_pin_check(void);
+// Log what each DAC pin actually reads (clock ~50%, static 0/100%); also
+// written to out (if not NULL) as text. Returns the text length.
+int pcm1690_pin_check(char *out, size_t n);
 esp_err_t pcm1690_set_attenuation(uint8_t ch, uint8_t code);  // ch 0..7, 0xFF = 0 dB
 
 #endif // PCM1690_H

@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>N-Series DAC8</title>
+<style>
+:root{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mut:#6e6e73;--line:#d2d2d7;--acc:#0071e3;--ok:#1f9d55;--warn:#c27c0e;--bad:#d70015}
+@media (prefers-color-scheme:dark){:root{--bg:#161618;--card:#232326;--fg:#f2f2f7;--mut:#98989f;--line:#3a3a3c;--acc:#409cff;--ok:#32d74b;--warn:#ffb340;--bad:#ff453a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 -apple-system,system-ui,"Segoe UI",sans-serif}
+main{max-width:720px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:22px;margin:0}h2{font-size:15px;margin:0 0 12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+header{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.sub{color:var(--mut);font-size:13px}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px 16px}
+.k{color:var(--mut);font-size:12px}.v{font-size:16px;font-variant-numeric:tabular-nums}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--mut)}
+.ok{background:var(--ok)}.warn{background:var(--warn)}.bad{background:var(--bad)}
+.vol{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.vol input[type=range]{flex:1;min-width:180px;accent-color:var(--acc)}
+.db{font-size:28px;font-variant-numeric:tabular-nums;min-width:96px;text-align:right}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:8px;padding:7px 14px;cursor:pointer}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button.on{background:var(--bad);border-color:var(--bad);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.msg{margin-top:10px;font-size:14px}.msg.err{color:var(--bad)}
+progress{width:100%;height:8px;margin-top:10px;display:none}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td,th{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}th{color:var(--mut);font-weight:500;font-size:12px}
+td:first-child{color:var(--mut);width:28px}
+.notes{white-space:pre-wrap;color:var(--mut);font-size:13px;margin-top:6px}
+</style></head>
+<body><main>
+<header><div><h1 id="name">N-Series DAC8</h1><div class="sub" id="ident">connecting…</div></div>
+<div class="sub" id="sync"><span class="dot"></span>…</div></header>
+
+<section><h2>Output volume</h2>
+<div class="vol"><input type="range" id="vol" min="-60" max="4" step="1" value="0" aria-label="Output volume">
+<div class="db" id="db">0 dB</div><button id="mute">Mute</button></div>
+<div class="sub" style="margin-top:6px">All 8 outputs. The level is kept after a restart; mute is not.</div></section>
+
+<section><h2>Status</h2><div class="grid" id="stat"></div></section>
+
+<section><h2>Firmware</h2>
+<div class="grid">
+<div><div class="k">Installed</div><div class="v" id="fwv">–</div></div>
+<div><div class="k">Latest on server</div><div class="v" id="fwl">–</div></div>
+<div><div class="k">Built</div><div class="v" id="fwb" style="font-size:13px">–</div></div></div>
+<div class="notes" id="notes"></div>
+<div class="row"><button id="check">Check for update</button><button id="install" class="primary" style="display:none"></button>
+<button id="previous" style="display:none"></button></div>
+<div class="row"><label class="sub">Or install a file: <input type="file" id="file" accept=".fw"></label></div>
+<progress id="prog" max="1" value="0"></progress>
+<div class="msg" id="fwmsg"></div></section>
+
+<section><h2>Receive channels</h2><table><thead><tr><th>#</th><th>Output</th><th>Source</th></tr></thead><tbody id="chs"></tbody></table></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let st = null, latest = null, dragging = false, busy = false;
+
+function cmpVer(a, b) {
+  const pa = String(a).split(/[.-]/).map(n => parseInt(n) || 0), pb = String(b).split(/[.-]/).map(n => parseInt(n) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d; }
+  return 0;
+}
+function dur(s) { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? `${d} d ${h} h` : h ? `${h} h ${m} min` : `${m} min`; }
+function msg(t, err) { $('fwmsg').textContent = t; $('fwmsg').className = 'msg' + (err ? ' err' : ''); }
+function cell(k, v) { return `<div><div class="k">${k}</div><div class="v">${v}</div></div>`; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function render(s) {
+  st = s;
+  document.title = s.name + ' · DAC8';
+  $('name').textContent = s.name;
+  $('ident').textContent = `${s.ip} · ${s.mac}`;
+  const sync = s.ptp_locked ? (Math.abs(s.ptp_offset_ns) < 10000 ? 'ok' : 'warn') : 'bad';
+  $('sync').innerHTML = `<span class="dot ${sync}"></span>${s.ptp_locked ? 'Clock locked' : 'No clock'}`;
+  if (!dragging) { $('vol').min = s.gain_min; $('vol').max = s.gain_max; $('vol').value = s.gain_db; }
+  showDb(dragging ? +$('vol').value : s.gain_db);
+  $('mute').classList.toggle('on', !!s.mute); $('mute').textContent = s.mute ? 'Muted' : 'Mute';
+  $('stat').innerHTML = cell('Sample rate', s.rate / 1000 + ' kHz') + cell('Latency', s.latency_us / 1000 + ' ms')
+    + cell('Clock offset', s.ptp_locked ? (s.ptp_offset_ns / 1000).toFixed(1) + ' µs' : '–')
+    + cell('Audio flows', s.flows) + cell('Late packets', s.late) + cell('Clock losses', s.ptp_lock_losses)
+    + cell('Up', dur(s.uptime_s));
+  $('fwv').textContent = s.version; $('fwb').textContent = s.build;
+  $('previous').style.display = s.previous && s.previous !== s.version ? '' : 'none';
+  $('previous').textContent = 'Go back to ' + s.previous;
+  $('chs').innerHTML = s.channels.map((c, i) => `<tr><td>${i + 1}</td><td>${esc(c.name || 'Output ' + (i + 1))}</td>`
+    + `<td>${c.tx_channel ? esc(c.tx_channel + ' @ ' + c.tx_device) : '<span class="sub">–</span>'}</td></tr>`).join('');
+  showLatest();
+}
+function showDb(v) { $('db').textContent = (v > 0 ? '+' : '') + v + ' dB'; }
+
+async function poll() {
+  try { const r = await fetch('/api/status', {cache: 'no-store'}); if (r.ok) render(await r.json()); }
+  catch (e) { $('ident').textContent = 'not reachable'; }
+}
+async function setVol(q) {
+  const r = await fetch('/api/volume?' + q, {method: 'POST'}); if (r.ok) render(await r.json());
+}
+$('vol').addEventListener('input', () => { dragging = true; showDb(+$('vol').value); });
+$('vol').addEventListener('change', async () => { await setVol('db=' + $('vol').value); dragging = false; });
+$('mute').addEventListener('click', () => setVol('mute=' + (st && st.mute ? 0 : 1)));
+
+// The update server is reached from THIS computer: the DAC8 itself has no
+// route off the Dante network. The request doubles as the DAC8's check-in.
+async function check(quiet) {
+  if (!st) return;
+  if (!st.update_url) { if (!quiet) msg('No update server is set in this firmware; install a file instead.', true); return; }
+  const q = new URLSearchParams({id: st.mac, name: st.name, version: st.version, ip: st.ip, rate: st.rate,
+    latency_us: st.latency_us, gain_db: st.gain_db, flows: st.flows, uptime_s: st.uptime_s});
+  try {
+    const r = await fetch(`${st.update_url}/api/firmware/${st.product}/latest?${q}`, {cache: 'no-store'});
+    if (!r.ok) throw new Error('server answered ' + r.status);
+    latest = await r.json();
+    if (!quiet) msg('');
+  } catch (e) {
+    latest = null;
+    if (!quiet) msg('Update server not reachable from this computer (' + e.message + ').', true);
+  }
+  showLatest();
+}
+function showLatest() {
+  if (!latest || !st) { $('install').style.display = 'none'; return; }
+  $('fwl').textContent = latest.version;
+  $('notes').textContent = latest.notes || '';
+  const newer = cmpVer(latest.version, st.version) > 0;
+  $('install').style.display = newer && !busy ? '' : 'none';
+  $('install').textContent = 'Install ' + latest.version;
+  if (!newer && !busy && !$('fwmsg').textContent) msg('Up to date.');
+}
+
+function upload(blob) {
+  return new Promise((ok, bad) => {
+    const x = new XMLHttpRequest();
+    x.open('POST', '/api/update');
+    x.upload.onprogress = e => { if (e.lengthComputable) $('prog').value = e.loaded / e.total; };
+    x.onload = () => x.status === 200 ? ok() : bad(new Error(x.responseText || 'HTTP ' + x.status));
+    x.onerror = () => bad(new Error('connection lost'));
+    x.send(blob);
+  });
+}
+// Back after the restart: uptime has started again from zero.
+async function waitBack(before) {
+  for (let i = 0; i < 90; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    try { const r = await fetch('/api/status', {cache: 'no-store'});
+      if (r.ok) { const s = await r.json(); if (s.uptime_s < before) return s; } } catch (e) {}
+  }
+  throw new Error('the DAC8 did not come back within 90 s');
+}
+async function install(getBlob, label) {
+  if (busy) return;
+  if (!confirm(`Install ${label}? The outputs are muted during the update and the DAC8 restarts (about 20 s).`)) return;
+  busy = true; showLatest();
+  for (const b of ['check', 'previous', 'file']) $(b).disabled = true;
+  $('prog').style.display = 'block'; $('prog').value = 0;
+  try {
+    msg('Downloading…'); const blob = await getBlob();
+    msg('Sending to the DAC8…'); await upload(blob);
+    msg('Verified. Restarting…'); const s = await waitBack(st.uptime_s + 5);
+    render(s);
+    msg(`Running ${s.version}. It stays on trial for a minute; if it restarts before then, the old version comes back.`);
+  } catch (e) { msg('Update failed: ' + e.message, true); }
+  busy = false; $('prog').style.display = 'none';
+  for (const b of ['check', 'previous', 'file']) $(b).disabled = false;
+  $('file').value = ''; showLatest();
+}
+$('check').addEventListener('click', () => check(false));
+$('install').addEventListener('click', () => install(async () => {
+  const r = await fetch(new URL(latest.url, st.update_url + '/'), {cache: 'no-store'});
+  if (!r.ok) throw new Error('download: server answered ' + r.status);
+  return r.blob();
+}, latest.version));
+$('file').addEventListener('change', () => { const f = $('file').files[0]; if (f) install(async () => f, f.name); });
+$('previous').addEventListener('click', async () => {
+  if (!confirm(`Go back to ${st.previous}? The DAC8 restarts.`)) return;
+  const r = await fetch('/api/previous', {method: 'POST'});
+  if (!r.ok) return msg(await r.text(), true);
+  msg('Restarting…');
+  try { render(await waitBack(st.uptime_s + 5)); msg('Running ' + st.version + '.'); } catch (e) { msg(e.message, true); }
+});
+
+poll().then(() => check(true));
+setInterval(() => { if (!busy) poll(); }, 2000);
+</script>
+</body></html>

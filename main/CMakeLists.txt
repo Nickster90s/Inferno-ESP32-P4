@@ -21,10 +21,13 @@ idf_component_register(
         "subscriber.c"
         "telem.c"
         "console.c"
+        "web.c"
     INCLUDE_DIRS "."
+    EMBED_TXTFILES "web_page.html" "fw_sign_pub.pem"
     REQUIRES
-        esp_eth esp_netif esp_timer esp_driver_i2s esp_driver_spi esp_driver_i2c esp_driver_gpio
+        esp_eth esp_netif esp_timer esp_driver_i2s esp_driver_spi esp_driver_i2c esp_driver_gpio esp_driver_pcnt
         lwip mdns nvs_flash esp_hw_support driver console vfs esp_mm
+        esp_http_server app_update esp_app_format bootloader_support mbedtls
 )
 
 # Sample rate.
@@ -44,4 +47,15 @@ if(DEFINED SAMPLE_RATE)
     message(STATUS "aoip-rx: sample rate PINNED at ${SAMPLE_RATE} Hz (rate pin ignored)")
 else()
     message(STATUS "aoip-rx: sample rate selected at boot by AP_PIN_RATE_SEL")
+endif()
+
+# Update server the web page checks for new firmware (main/web.c): the first
+# line of .secrets/update-url, e.g. https://reports.example.com. Without it
+# the page still installs a .fw file chosen by hand.
+set(update_url_file "${CMAKE_SOURCE_DIR}/.secrets/update-url")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${update_url_file}")
+if(EXISTS "${update_url_file}")
+    file(STRINGS "${update_url_file}" update_url LIMIT_COUNT 1)
+    string(STRIP "${update_url}" update_url)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE AP_UPDATE_URL="${update_url}")
 endif()

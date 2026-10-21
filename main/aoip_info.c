@@ -373,7 +373,7 @@ static void send_rate_table(const uint8_t ip[4], uint16_t port, const uint8_t *r
 #include "esp_system.h"
 static esp_timer_handle_t s_restart_timer;
 
-static void restart_cb(void *arg) { (void)arg; esp_restart(); }
+static void restart_cb(void *arg) { (void)arg; eth_ts_reboot(); }
 
 static void handle_rate_set(const uint8_t *req, int len)
 {

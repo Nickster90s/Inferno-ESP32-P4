@@ -7,3 +7,8 @@ sdkconfig.old
 # Python
 __pycache__/
 *.pyc
+.secrets/
+dist/
+build-p4v3/
+sdkconfig.p4v3
+sdkconfig.p4v3.old

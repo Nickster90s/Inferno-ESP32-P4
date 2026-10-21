@@ -40,7 +40,12 @@ typedef struct {
 // Control-port opcode 0x0102 is NOT the keepalive -- it re-sets a flow's
 // channel list. First bench run: DVS accepted every flow request, streamed for
 // ~2 s, then answered 0x0102 with 0x0103 "expired", forever.
-#define KEEPALIVE_US        250000
+// 100 ms, not inferno's 250: a Prodigy (Brooklyn-3) transmitter drops a flow
+// after ~1 s without one (measured from a PC: no keepalive -> audio stopped
+// after 1.1 s, "0x0103" on stop), so 250 ms left four chances. The DAC8 lost
+// its flow 7 times in 30 minutes; each time the keepalive log showed a ~940 ms
+// gap while the receive loop was held up elsewhere. Hence also their own task.
+#define KEEPALIVE_US        100000
 static const uint8_t KEEPALIVE[2] = { 0x13, 0x37 };
 
 static flow_t s_flows[AP_MAX_FLOWS];
@@ -141,10 +146,11 @@ static void handle_packet(flow_t *fl, const uint8_t *buf, int len)
 // from the audio port. It is never read while the fast path is on. And
 // nothing here may call lwIP -- emac_rx feeds lwIP, so a send from here could
 // wait on the very thread that waits on us. The first packet's keepalive is
-// therefore flagged to the aoip_rx task instead of sent.
+// therefore flagged to the keepalive task instead of sent.
 // ---------------------------------------------------------------------------
 static volatile bool s_fast = true;
 static volatile bool s_ka_now;
+static volatile bool s_src_note;
 
 void aoip_rx_set_fast_path(bool on)
 {
@@ -166,7 +172,14 @@ static bool fast_input(uint32_t src_ip_be, uint16_t src_port, uint16_t dst_port,
         fl->src.sin_addr.s_addr = src_ip_be;
         fl->src.sin_port = htons(src_port);
         __atomic_store_n(&fl->have_src, true, __ATOMIC_RELEASE);
-        s_ka_now = true;                             // aoip_rx task sends it
+        s_ka_now = true;                             // the keepalive task sends it
+    } else if (fl->src.sin_addr.s_addr != src_ip_be || fl->src.sin_port != htons(src_port)) {
+        // DIAGNOSTIC: a second stream into this port (a stale flow on the
+        // transmitter?) -- the keepalive only goes to the latched source.
+        s_st.src_other++;
+        s_st.src_other_ip = src_ip_be;
+        s_st.src_other_port = src_port;
+        s_src_note = true;
     }
     handle_packet(fl, payload, (int)len);
     s_st.fast_packets++;
@@ -175,14 +188,28 @@ static bool fast_input(uint32_t src_ip_be, uint16_t src_port, uint16_t dst_port,
 
 static void send_keepalives(void)
 {
+    static int64_t last_ok;
     for (int i = 0; i < AP_MAX_FLOWS; i++) {
         flow_t *fl = &s_flows[i];
         if (!fl->active || fl->sock < 0 || !fl->have_src) continue;
+        int64_t t0 = esp_timer_get_time();
         // CHECKED: an unsent keepalive is invisible otherwise, and four
         // seconds of them is a dropped flow on the transmitter.
         if (sendto(fl->sock, KEEPALIVE, sizeof(KEEPALIVE), 0,
                    (struct sockaddr *)&fl->src, sizeof(fl->src)) == sizeof(KEEPALIVE)) {
             s_st.ka_sent++;
+            int64_t t1 = esp_timer_get_time();
+            if (t1 - t0 > s_st.ka_send_max_us) s_st.ka_send_max_us = (uint32_t)(t1 - t0);
+            if (last_ok) {
+                int64_t gap = t1 - last_ok;
+                if (gap > s_st.ka_gap_max_us) s_st.ka_gap_max_us = (uint32_t)gap;
+                if (gap > 500000) {
+                    s_st.ka_gaps_500ms++;
+                    ESP_LOGW(TAG, "keepalive gap %lld ms (sendto took %lld ms)",
+                             (long long)(gap / 1000), (long long)((t1 - t0) / 1000));
+                }
+            }
+            last_ok = t1;
         } else {
             s_st.ka_failed++;
             s_st.ka_last_errno = errno;
@@ -190,18 +217,90 @@ static void send_keepalives(void)
     }
 }
 
-static void rx_task(void *arg)
+// KEEPALIVES, on their own task: nothing the receive loop waits on (select,
+// a socket drain, the log) may delay them.
+static volatile uint32_t s_ka_loops;
+
+static void ka_task(void *arg)
 {
     (void)arg;
     int64_t next_ka = 0;
     for (;;) {
-        if (s_ka_now) { s_ka_now = false; next_ka = 0; }
+        s_ka_loops++;
         int64_t now = esp_timer_get_time();
-        if (now >= next_ka) {
+        if (s_ka_now || now >= next_ka) {
+            s_ka_now = false;
             send_keepalives();
             next_ka = now + KEEPALIVE_US;
         }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
 
+// STALL DETECTOR (diagnostic). Core 0 sometimes stops running everything
+// below some priority for ~1 s (keepalive gap and select() both 940-1260 ms),
+// and the Prodigy drops the flow. From core 1, sample which task core 0 is
+// running every 5 ms; when the keepalive task has not looped for 300 ms, say
+// who had the core.
+#define STALL_SLOTS 6
+static void stall_task(void *arg)
+{
+    (void)arg;
+    uint32_t last_loops = s_ka_loops;
+    int64_t last_move = esp_timer_get_time();
+    TaskHandle_t h[STALL_SLOTS] = {0};
+    uint32_t c[STALL_SLOTS] = {0};
+    bool in_stall = false;
+    uint32_t f0 = eth_ts_rx_frames(), a0 = s_st.fast_packets;
+    uint64_t hk0, bt0;
+    eth_ts_hook_times(&hk0, &bt0);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        int64_t now = esp_timer_get_time();
+        uint32_t l = s_ka_loops;
+        if (l != last_loops) {
+            if (in_stall) {
+                char buf[160]; int n = 0;
+                for (int i = 0; i < STALL_SLOTS && h[i]; i++)
+                    n += snprintf(buf + n, sizeof(buf) - n, " %s:%u", pcTaskGetName(h[i]),
+                                  (unsigned)(c[i] * 5));
+                uint64_t hk, bt;
+                eth_ts_hook_times(&hk, &bt);
+                uint32_t nf = eth_ts_rx_frames() - f0;
+                ESP_LOGW(TAG, "core-0 stall %lld ms, %u frames (%u audio), per frame: hook %u us, driver %u us; core 0 ran (ms):%s",
+                         (long long)((now - last_move) / 1000), (unsigned)nf,
+                         (unsigned)(s_st.fast_packets - a0),
+                         (unsigned)(nf ? (hk - hk0) / nf : 0), (unsigned)(nf ? (bt - bt0) / nf : 0), buf);
+                in_stall = false;
+            }
+            last_loops = l; last_move = now;
+            f0 = eth_ts_rx_frames(); a0 = s_st.fast_packets;
+            eth_ts_hook_times(&hk0, &bt0);
+            memset(h, 0, sizeof(h)); memset(c, 0, sizeof(c));
+            continue;
+        }
+        if (now - last_move > 300000) in_stall = true;
+        TaskHandle_t cur = xTaskGetCurrentTaskHandleForCore(0);
+        for (int i = 0; i < STALL_SLOTS; i++) {
+            if (h[i] == cur) { c[i]++; break; }
+            if (!h[i]) { h[i] = cur; c[i] = 1; break; }
+        }
+    }
+}
+
+static void rx_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        static int64_t last_note;
+        if (s_src_note && esp_timer_get_time() - last_note > 1000000) {
+            s_src_note = false;
+            last_note = esp_timer_get_time();
+            uint32_t ip = ntohl(s_st.src_other_ip);
+            ESP_LOGW(TAG, "audio from another source %u.%u.%u.%u:%u (%u so far)",
+                     (unsigned)(ip >> 24), (unsigned)(ip >> 16 & 255), (unsigned)(ip >> 8 & 255),
+                     (unsigned)(ip & 255), (unsigned)s_st.src_other_port, (unsigned)s_st.src_other);
+        }
         fd_set rfds;
         FD_ZERO(&rfds);
         int maxfd = -1;
@@ -214,7 +313,11 @@ static void rx_task(void *arg)
         if (maxfd < 0) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
 
         struct timeval tv = { .tv_sec = 0, .tv_usec = 20000 };
+        int64_t t_sel = esp_timer_get_time();
         int n = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        t_sel = esp_timer_get_time() - t_sel;
+        if (t_sel > 200000)
+            ESP_LOGW(TAG, "select() blocked %lld ms (20 ms timeout)", (long long)(t_sel / 1000));
         if (n <= 0) continue;
 
         for (int i = 0; i < AP_MAX_FLOWS; i++) {
@@ -232,7 +335,7 @@ static void rx_task(void *arg)
                 if (!fl->have_src) {
                     fl->src = from;
                     fl->have_src = true;
-                    send_keepalives();          // first one immediately
+                    s_ka_now = true;            // first one immediately
                 }
                 handle_packet(fl, s_rxbuf, len);
             }
@@ -344,5 +447,15 @@ esp_err_t aoip_rx_start(void)
     eth_ts_register_audio_cb(fast_input);
     BaseType_t ok = xTaskCreatePinnedToCore(rx_task, "aoip_rx", 4096, NULL,
                                             AP_PRIO_RX, NULL, AP_CORE_AUDIO);
+    if (ok == pdPASS)
+        // Core 0, just above the receive loop. NOT the control core: sent
+        // from core 1 ten times a second, the keepalives pinned emac_rx (core
+        // 0, prio 24) at 100% within 10 s of the flow starting -- IDLE0 never
+        // ran, task watchdog every 5 s, PTP lost.
+        ok = xTaskCreatePinnedToCore(ka_task, "aoip_ka", 3072, NULL,
+                                     AP_PRIO_RX + 1, NULL, AP_CORE_AUDIO);
+    if (ok == pdPASS)
+        ok = xTaskCreatePinnedToCore(stall_task, "stall_mon", 3072, NULL,
+                                     AP_PRIO_CONTROL + 1, NULL, AP_CORE_CONTROL);
     return ok == pdPASS ? ESP_OK : ESP_FAIL;
 }

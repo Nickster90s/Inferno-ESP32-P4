@@ -20,7 +20,7 @@ typedef struct {
     uint16_t master_port_id;
 
     int64_t  offset_ns;
-    int64_t  filtered_ns;           // after the median, outliers held out: what is REPORTED
+    int64_t  filtered_ns;           // low edge of the servo window: what is REPORTED
     uint32_t lock_losses;
     int64_t  mean_path_delay_ns;
 
