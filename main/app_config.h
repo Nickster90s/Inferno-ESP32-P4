@@ -18,6 +18,13 @@
 #define AP_NCH              8           // PCM1690 = 8 channels, DAC only
 #define AP_BITS_PER_SAMPLE  24          // AoIP wire format, MSB-justified BE
 
+// Output order. 1: receive channel 1 plays on DAC output 8 (VOUT8) and channel
+// 8 on output 1; 0: channel n on output n. Only where the samples enter the
+// playout ring (jitterbuf.c) -- the controller, the meters and the web page
+// keep the receive channel numbers.
+#define AP_OUTPUT_REVERSED  1
+#define AP_OUT_SLOT(ch)     (AP_OUTPUT_REVERSED ? AP_NCH - 1 - (ch) : (ch))
+
 // ---------------------------------------------------------------------------
 // SAMPLE RATE -- selected by a pin at boot
 // ---------------------------------------------------------------------------
@@ -84,6 +91,11 @@
 // avoid those too if you move this pin.
 #define AP_PIN_RATE_SEL     19      // to GND = 96 kHz; open = 48 kHz
 #endif
+
+// Sync LED (sync_led.c): GPIO -> resistor (~1 k) -> LED -> GND. On = PTP and
+// media clock locked. -1 = no LED. Same rules as above: off the strapping and
+// Ethernet pins.
+#define AP_PIN_SYNC_LED     15
 
 // ---------------------------------------------------------------------------
 // What each rate demands of the PCM1690  (datasheet SBAS448B, Table 5,

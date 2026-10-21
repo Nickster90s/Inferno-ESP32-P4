@@ -22,6 +22,7 @@ idf_component_register(
         "telem.c"
         "console.c"
         "web.c"
+        "sync_led.c"
     INCLUDE_DIRS "."
     EMBED_TXTFILES "web_page.html" "fw_sign_pub.pem"
     REQUIRES

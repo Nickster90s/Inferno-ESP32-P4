@@ -86,8 +86,11 @@ Outputs: `CH1/CH2 → J5`, `CH3/CH4 → J6`, `CH5/CH6 → J7`, `CH7/CH8 → J8`
 (odd = tip, even = ring). They are **line level** (~1.4 Vrms, ~150 Ω), not
 headphone outputs.
 
-Other pins: **GPIO19** selects the rate at boot (open = 48 kHz). The board's
-Ethernet uses 28–31, 34, 35, 49, 50, 52.
+Other pins: **GPIO19** selects the rate at boot (open = 48 kHz). **GPIO15**
+drives the sync LED (GPIO → ~1 kΩ → LED → GND; `sync_led.c`): on = PTP locked
+and the media clock disciplined, fast blink = leader heard but not locked yet,
+slow blink = PTP locked but the media clock not yet disciplined, off = no
+leader. The board's Ethernet uses 28–31, 34, 35, 49, 50, 52.
 
 **GPIO24–27 are the P4's USB PHY pads.** `USB_SERIAL_JTAG.conf0.usb_pad_enable`
 resets to 1, so the PHY owns them until it is switched off; `pcm1690.c` clears
@@ -118,6 +121,11 @@ A v3.x chip runs at 400 MHz (v1.x: 360). The web update keeps the two apart:
 the firmware product is `dac8` (v1.x) or `dac8v3` (v3.x), and the DAC8 refuses
 an image whose chip-revision range does not include its own chip ("firmware is
 for another chip revision").
+
+**Output order** is fixed in the firmware: `AP_OUTPUT_REVERSED` in
+`main/app_config.h` (1 = receive channel 1 on DAC output 8 … channel 8 on
+output 1; 0 = channel n on output n). Meters, the controller and the web page
+keep the receive channel numbers.
 
 Console is UART at 115200. On this board, **opening the serial port can reset
 the chip** (the CH343's DTR/RTS drive EN and the boot strap), so read logs with
@@ -836,6 +844,7 @@ stored on the device.
 | `jitterbuf.[ch]` | timestamp-indexed ring = the I2S DMA buffers, played directly; position from the TX interrupt |
 | `aoip_rx.[ch]` | audio sockets, keepalive, input meters |
 | `audio_out.[ch]` | I2S TDM8, SCKI = BCK routing, output meters |
+| `sync_led.[ch]` | sync LED: PTP / media-clock lock state on GPIO15 |
 | `pcm1690.[ch]` | DAC control (SPI, I2C detected), USB pad release, pin check |
 | `chan_resolve.[ch]`, `flows_client.[ch]`, `subscriber.[ch]` | subscriptions → flows, persisted in NVS |
 | `aoip_arc.[ch]` | ARC server |

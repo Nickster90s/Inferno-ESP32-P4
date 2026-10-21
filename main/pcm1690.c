@@ -224,6 +224,7 @@ int pcm1690_pin_check(char *out, size_t n)
         { AP_PIN_I2S_WS,   "LRCK" }, { AP_PIN_I2S_DOUT, "DIN1" },
         { AP_PIN_DAC_SPI_CS, "CS  " }, { AP_PIN_DAC_SPI_CLK, "SCL " },
         { AP_PIN_DAC_SPI_MOSI, "SDA " }, { AP_PIN_DAC_RST, "RST " },
+        { AP_PIN_SYNC_LED, "LED " },
     };
     int len = 0;
     for (size_t i = 0; i < sizeof(p) / sizeof(p[0]); i++) {

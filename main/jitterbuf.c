@@ -267,7 +267,7 @@ bool jb_write(uint64_t first_idx, uint32_t nframes,
                     int64_t g = ((int64_t)v * gain) >> 16;
                     v = g > INT32_MAX ? INT32_MAX : g < INT32_MIN ? INT32_MIN : (int32_t)g;
                 }
-                row[ch] = v;
+                row[AP_OUT_SLOT(ch)] = v;
             }
         }
     }
@@ -289,7 +289,7 @@ void jb_peek_peaks(uint32_t peaks[AP_NCH])
     const int32_t *b = s_buf[((uint64_t)pos >> s_fshift) % s_nbufs];
     for (uint32_t f = 0; f < s_F; f++) {
         for (int c = 0; c < AP_NCH; c++) {
-            int32_t v = b[f * AP_NCH + c];
+            int32_t v = b[f * AP_NCH + AP_OUT_SLOT(c)];
             uint32_t a = (uint32_t)(v < 0 ? -(int64_t)v : v);
             if (a > peaks[c]) peaks[c] = a;
         }
