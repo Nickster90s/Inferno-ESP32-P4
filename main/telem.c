@@ -129,6 +129,7 @@ static int build_stats(char *out, size_t cap)
         "rx_ka_gap_max_us=%u\n"
         "rx_ka_send_max_us=%u\n"
         "rx_ka_gaps_500ms=%u\n"
+        "rx_stray_packets=%u\n"
         "rx_src_other=%u\n"
         "rx_src_other_port=%u\n"
         "rx_ka_sent=%u\n"
@@ -175,7 +176,7 @@ static int build_stats(char *out, size_t cap)
         (unsigned)rx.packets, (unsigned)rx.bad_magic, (unsigned)rx.short_pkt,
         (unsigned)rx.wrong_len,
         (unsigned)rx.ka_gap_max_us, (unsigned)rx.ka_send_max_us, (unsigned)rx.ka_gaps_500ms,
-        (unsigned)rx.src_other, (unsigned)rx.src_other_port,
+        (unsigned)rx.stray_packets, (unsigned)rx.src_other, (unsigned)rx.src_other_port,
         (unsigned)rx.ka_sent, (unsigned)rx.ka_failed, (int)rx.ka_last_errno, (int)rx.lat_max_samples, (unsigned)rx.fast_packets, (int)aoip_rx_fast_path(),
         (unsigned)g_flows_diag.last_opcode, (unsigned)g_flows_diag.last_code,
         (unsigned)g_flows_diag.refused, (unsigned)g_flows_diag.timeouts,

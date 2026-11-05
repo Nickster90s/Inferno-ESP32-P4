@@ -32,21 +32,22 @@ typedef struct {
     bool     have_src;
 } flow_t;
 
-// THE FLOW KEEPALIVE. Two bytes, 0x13 0x37, sent every 250 ms FROM the audio
-// receive socket TO the transmitter's audio source address (inferno
-// flows_rx.rs KEEPALIVE_CONTENT / KEEPALIVE_INTERVAL). A transmitter drops a
-// flow after 4 s without one (flows_tx.rs KEEPALIVE_TIMEOUT_SECONDS).
+// THE FLOW KEEPALIVE, sent FROM the audio receive socket TO the transmitter's
+// audio source address. What a real receiver sends, measured from a Leine
+// Prodigy (server_vers 4.2.0) at the FPGA talker's media port: 02 00 00 00 +
+// u32 LE counter, every 250 ms, counter +1 per second. Inferno's transmitter
+// counts any datagram and waits 4 s (flows_tx.rs KEEPALIVE_TIMEOUT_SECONDS).
+// 30 minutes against a Prodigy and DVS at 96 kHz: no drops (2026-11-05).
 //
 // Control-port opcode 0x0102 is NOT the keepalive -- it re-sets a flow's
 // channel list. First bench run: DVS accepted every flow request, streamed for
 // ~2 s, then answered 0x0102 with 0x0103 "expired", forever.
-// 100 ms, not inferno's 250: a Prodigy (Brooklyn-3) transmitter drops a flow
-// after ~1 s without one (measured from a PC: no keepalive -> audio stopped
-// after 1.1 s, "0x0103" on stop), so 250 ms left four chances. The DAC8 lost
-// its flow 7 times in 30 minutes; each time the keepalive log showed a ~940 ms
-// gap while the receive loop was held up elsewhere. Hence also their own task.
-#define KEEPALIVE_US        100000
-static const uint8_t KEEPALIVE[2] = { 0x13, 0x37 };
+// A Prodigy (Brooklyn-3) transmitter drops a flow after ~1 s without one
+// (measured from a PC: no keepalive -> audio stopped after 1.1 s, "0x0103" on
+// stop). The DAC8 lost its flow 7 times in 30 minutes; each time the keepalive
+// log showed a ~940 ms gap while the receive loop was held up elsewhere. Hence
+// their own task.
+#define KEEPALIVE_US        250000
 
 static flow_t s_flows[AP_MAX_FLOWS];
 // Guards nslots / slot_to_ch against aoip_rx_remap_flow() on the other core.
@@ -166,7 +167,15 @@ static bool fast_input(uint32_t src_ip_be, uint16_t src_port, uint16_t dst_port,
     uint16_t idx = (uint16_t)(dst_port - AOIP_RX_AUDIO_PORT);
     if (idx >= AP_MAX_FLOWS) return false;
     flow_t *fl = &s_flows[idx];
-    if (!fl->active || fl->sock < 0) return false;   // not ours now: let lwIP answer
+    if (!fl->active || fl->sock < 0) {
+        // No flow on this port, but a transmitter still sends here (it missed
+        // the end of the flow). Drop it: in lwIP every packet cost the tcpip
+        // thread a lookup and got an ICMP port-unreachable back. Two flows
+        // left running on the FPGA talker came back as ~5000 ICMP/s, and its
+        // two RX slots lost PTP to them (2026-11-05).
+        s_st.stray_packets++;
+        return true;
+    }
     if (!fl->have_src) {
         fl->src.sin_family = AF_INET;
         fl->src.sin_addr.s_addr = src_ip_be;
@@ -189,14 +198,17 @@ static bool fast_input(uint32_t src_ip_be, uint16_t src_port, uint16_t dst_port,
 static void send_keepalives(void)
 {
     static int64_t last_ok;
+    uint8_t ka[8] = { 0x02, 0x00, 0x00, 0x00 };
+    uint32_t secs = (uint32_t)(esp_timer_get_time() / 1000000);
+    memcpy(ka + 4, &secs, sizeof(secs));            // little-endian, as measured
     for (int i = 0; i < AP_MAX_FLOWS; i++) {
         flow_t *fl = &s_flows[i];
         if (!fl->active || fl->sock < 0 || !fl->have_src) continue;
         int64_t t0 = esp_timer_get_time();
         // CHECKED: an unsent keepalive is invisible otherwise, and four
         // seconds of them is a dropped flow on the transmitter.
-        if (sendto(fl->sock, KEEPALIVE, sizeof(KEEPALIVE), 0,
-                   (struct sockaddr *)&fl->src, sizeof(fl->src)) == sizeof(KEEPALIVE)) {
+        if (sendto(fl->sock, ka, sizeof(ka), 0,
+                   (struct sockaddr *)&fl->src, sizeof(fl->src)) == sizeof(ka)) {
             s_st.ka_sent++;
             int64_t t1 = esp_timer_get_time();
             if (t1 - t0 > s_st.ka_send_max_us) s_st.ka_send_max_us = (uint32_t)(t1 - t0);

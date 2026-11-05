@@ -41,7 +41,7 @@ implementation for Linux. Almost everything a device has to say on this network
 was learned from reading it:
 
 - the request/response framing and the flow-control protocol: how to request a
-  flow, and the `13 37` keepalive that keeps it alive
+  flow, and the keepalive that keeps it alive
 - the ARC opcodes and reply layouts: channel counts, device names, receive
   channels, subscriptions
 - the CMC device advertisement, the info multicasts and the heartbeat
@@ -515,19 +515,26 @@ Receiving a flow:
   every 5 s, even while other flows play.
 - **Request** with flow-control opcode `0x0100` to the transmitter's 4455:
   one flow per transmitter, carrying every channel subscribed to it.
-- **Keepalive**: `13 37`, every **100 ms**, **from the audio socket to the
-  audio source address**, on its own task. Opcode `0x0102` is not a
-  keepalive. Inferno's transmitter waits 4 s, but a **Prodigy (Brooklyn-3)
-  drops a flow after ~1 s** without one (measured from a PC: no keepalive,
-  audio stopped after 1.1 s; `13 37` every 250 ms, 180 s without a drop). At
-  250 ms from the receive loop the DAC8 lost its Prodigy flow 7 times in 30
-  minutes, ~10 s of silence each: the gap log showed ~940 ms without a
+- **Keepalive**: `02 00 00 00` + u32 LE counter, every **250 ms**, counter +1
+  per second, **from the audio socket to the audio source address**, on its
+  own task. This is what a real receiver sends (measured from a Prodigy,
+  `server_vers` 4.2.0, at the FPGA talker's media port). 30 minutes against a
+  Prodigy and DVS at 96 kHz: no drops. Opcode `0x0102` is not a keepalive.
+  Inferno's transmitter counts any datagram and waits 4 s, but a **Prodigy
+  (Brooklyn-3) drops a flow after ~1 s** without one (measured from a PC: no
+  keepalive, audio stopped after 1.1 s; `13 37` every 250 ms, 180 s without a
+  drop). At 250 ms from the receive loop the DAC8 lost its Prodigy flow 7 times
+  in 30 minutes, ~10 s of silence each: the gap log showed ~940 ms without a
   keepalive each time (cause: the IDF driver stall, see "Patched ESP-IDF
   Ethernet driver"), the Prodigy then answered the stop with `0x0103`
-  "expired". (Copying the Prodigy's own receiver keepalive, `02 00 00 00` + a
-  u32 counter, made it worse: a drop every 16 s.) Every `sendto()` is checked
-  and counted (`rx_ka_sent` / `rx_ka_failed` / `rx_ka_errno`), and so are the
-  gaps (`rx_ka_gap_max_us`, `rx_ka_gaps_500ms`, a log line over 500 ms).
+  "expired". Every `sendto()` is checked and counted (`rx_ka_sent` /
+  `rx_ka_failed` / `rx_ka_errno`), and so are the gaps (`rx_ka_gap_max_us`,
+  `rx_ka_gaps_500ms`, a log line over 500 ms).
+- **High packet rates are a known limit**: a transmitter that advertises
+  `fpp=4,2` at 96 kHz sends 24,000 packets/s, and the DAC8 follows it. With such
+  a flow running, starting a Prodigy flow (fpp 8, 12,000 packets/s) held
+  keepalives up for over a second (`rx_ka_send_max_us` 1.07 s) and the Prodigy
+  dropped its flow every ~10 s. Without that flow: 30 minutes, no drops.
 - **Liveness**: a flow whose packet count stops for 3 s is torn down and
   re-requested.
 - **Status must be current**: a rebuild works on a snapshot and can take
@@ -776,6 +783,7 @@ The fields that matter most:
 | `rx_ka_sent`, `rx_ka_failed`, `rx_ka_errno` | flow keepalives sent / refused by the stack; failures mean transmit trouble |
 | `rx_ka_gap_max_us`, `rx_ka_send_max_us`, `rx_ka_gaps_500ms` | longest gap between keepalives, longest `sendto()`, gaps over 500 ms (a Prodigy drops the flow at ~1 s; flow re-requests count too) |
 | `rx_src_other`, `rx_src_other_port` | audio packets from a source other than the one the keepalive goes to |
+| `rx_stray_packets` | packets dropped on an audio port with no flow: a transmitter that missed the end of a flow |
 | `fc_last_op`, `fc_last_code`, `fc_refused`, `fc_timeouts`, `flow_fallbacks` | flow-control requests: last opcode and the transmitter's answer (`0xFFFF` no reply, `0xFFFE` could not send) |
 | `eth_rx_kicks`, `eth_rx_restarts`, `eth_phy_resets` | receive watchdog actions (should stay 0) |
 | `reset_reason` | why the board last started: 1 power-on, 3 software, 4 panic, 5–7 watchdog, 9 brown-out |

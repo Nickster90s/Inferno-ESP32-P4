@@ -26,6 +26,7 @@ typedef struct {
     uint32_t ka_gap_max_us;     // longest time between two keepalives sent
     uint32_t ka_send_max_us;    // longest single sendto()
     uint32_t ka_gaps_500ms;     // gaps over 500 ms (a Prodigy drops the flow at ~1 s)
+    uint32_t stray_packets;     // packets to a flow port with no flow, dropped
     uint32_t src_other;         // packets from a source other than the latched one
     uint32_t src_other_ip;      // the last such source (network order)
     uint16_t src_other_port;    // ... host order
